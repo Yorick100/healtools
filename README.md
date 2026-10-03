@@ -1,122 +1,49 @@
-# wxcloudrun-express
+# 康䇿工具箱 HEALTOOLS CloudRun v0.4.0
 
-[![GitHub license](https://img.shields.io/github/license/WeixinCloud/wxcloudrun-express)](https://github.com/WeixinCloud/wxcloudrun-express)
-![GitHub package.json dependency version (prod)](https://img.shields.io/github/package-json/dependency-version/WeixinCloud/wxcloudrun-express/express)
-![GitHub package.json dependency version (prod)](https://img.shields.io/github/package-json/dependency-version/WeixinCloud/wxcloudrun-express/sequelize)
+这是 v0.4.0 的微信云原生后端，替代 sparkpos.cn / WordPress 插件作为小程序运行时云端。
 
-微信云托管 Node.js Express 框架模版，实现简单的计数器读写接口，使用云托管 MySQL 读写、记录计数值。
+## 架构
 
-![](https://qcloudimg.tencent-cloud.cn/raw/be22992d297d1b9a1a5365e606276781.png)
+- 小程序通过 `wx.cloud.callContainer` 调用微信云托管，不再依赖 `request` 合法域名，也不再向客户端下发自定义 access/refresh token。
+- 微信云托管注入的 `x-wx-openid` / `x-wx-appid` 作为可信身份入口，后端映射到 HEALTOOLS `user_uuid`。
+- 云托管 MySQL 保存用户、推荐卡、五类工具记录、星星、同步与埋点，是行为事实的权威存储。
+- CloudBase AI+ 只把自由文本映射到有限 intent；真正可执行动作仍由服务端 Action Library 白名单决定。
+- 音频放 CloudBase 对象存储；`scripts/upload-audio.js` 批量上传并生成 `config/audio-files.json`。
+- `/admin` 保留轻量统计面板；由 Basic Auth 环境变量保护。
 
-## 快速开始
+## 必需环境变量
 
-前往 [微信云托管快速开始页面](https://cloud.weixin.qq.com/cloudrun/onekey)，选择相应语言的模板，根据引导完成部署。
+复制 `.env.example` 的键到微信云托管服务环境变量。真实数据库密码、腾讯云 SecretKey、管理员密码绝不能写入 Git。
 
-## 本地调试
-下载代码在本地调试，请参考[微信云托管本地调试指南](https://developers.weixin.qq.com/miniprogram/dev/wxcloudrun/src/guide/debug/)
+MySQL 地址使用控制台显示的内网地址。数据库建议把 `character_set_server` 改为 `utf8mb4` 并重启；本服务创建的表本身也固定使用 `utf8mb4`。
 
-## 实时开发
-代码变动时，不需要重新构建和启动容器，即可查看变动后的效果。请参考[微信云托管实时开发指南](https://developers.weixin.qq.com/miniprogram/dev/wxcloudrun/src/guide/debug/dev.html)
+## AI+
 
-## Dockerfile最佳实践
-请参考[如何提高项目构建效率](https://developers.weixin.qq.com/miniprogram/dev/wxcloudrun/src/scene/build/speed.html)
+1. 云开发控制台 → AI → 生文模型，开启要使用的模型。
+2. 把模型 ID 写入 `CLOUDBASE_AI_MODEL`。
+3. `CLOUDBASE_ENV_ID` 填云开发环境 ID。
+4. 独立 Node.js/云托管服务按官方 Node SDK 方式配置 `TENCENTCLOUD_SECRETID` / `TENCENTCLOUD_SECRETKEY`。
+5. `HEALTOOLS_AI_ENABLED=1`。
 
-## 项目结构说明
+AI 不可用、超时或未配置时，服务会自动退回 `deterministic_v040`，小程序仍能完整工作。
 
-```
-.
-├── Dockerfile
-├── README.md
-├── container.config.json
-├── db.js
-├── index.js
-├── index.html
-├── package.json
-```
+## 音频对象存储
 
-- `index.js`：项目入口，实现主要的读写 API
-- `db.js`：数据库相关实现，使用 `sequelize` 作为 ORM
-- `index.html`：首页代码
-- `package.json`：Node.js 项目定义文件
-- `container.config.json`：模板部署「服务设置」初始化配置（二开请忽略）
-- `Dockerfile`：容器配置文件
+把旧 release 中的 `HealTools_ServerAssets_v0.2.0.zip` 解压到本项目 `server_assets/v0.2.0/`，然后在本地：
 
-## 服务 API 文档
-
-### `GET /api/count`
-
-获取当前计数
-
-#### 请求参数
-
-无
-
-#### 响应结果
-
-- `code`：错误码
-- `data`：当前计数值
-
-##### 响应结果示例
-
-```json
-{
-  "code": 0,
-  "data": 42
-}
+```bash
+npm install
+npm run upload:audio
 ```
 
-#### 调用示例
+脚本会生成 `config/audio-files.json`。该文件只包含 `cloud://` fileID，不包含密钥，可以提交到仓库。小程序启动时通过 `wx.cloud.getTempFileURL` 解析为可播放 URL。
 
-```
-curl https://<云托管服务域名>/api/count
-```
+## 健康检查
 
-### `POST /api/count`
+部署成功后：
 
-更新计数，自增或者清零
+- `GET /system/ping`
+- 小程序真机通过 `wx.cloud.callContainer` 调用 `/auth/wechat`
+- 管理面板：`/admin`
 
-#### 请求参数
-
-- `action`：`string` 类型，枚举值
-  - 等于 `"inc"` 时，表示计数加一
-  - 等于 `"clear"` 时，表示计数重置（清零）
-
-##### 请求参数示例
-
-```
-{
-  "action": "inc"
-}
-```
-
-#### 响应结果
-
-- `code`：错误码
-- `data`：当前计数值
-
-##### 响应结果示例
-
-```json
-{
-  "code": 0,
-  "data": 42
-}
-```
-
-#### 调用示例
-
-```
-curl -X POST -H 'content-type: application/json' -d '{"action": "inc"}' https://<云托管服务域名>/api/count
-```
-
-## 使用注意
-如果不是通过微信云托管控制台部署模板代码，而是自行复制/下载模板代码后，手动新建一个服务并部署，需要在「服务设置」中补全以下环境变量，才可正常使用，否则会引发无法连接数据库，进而导致部署失败。
-- MYSQL_ADDRESS
-- MYSQL_PASSWORD
-- MYSQL_USERNAME
-以上三个变量的值请按实际情况填写。如果使用云托管内MySQL，可以在控制台MySQL页面获取相关信息。
-
-
-## License
-
-[MIT](./LICENSE)
+生产环境不要开启 `ALLOW_DEV_OPENID`。如果核心服务只由小程序调用，测试完成后建议关闭云托管公网访问；需要浏览器查看 `/admin` 时再临时打开公网，或后续把管理面板拆成单独的受控管理服务。
