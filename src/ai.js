@@ -80,7 +80,7 @@ async function modelIntents(text='') {
   const envId = String(process.env.CLOUDBASE_AI_ENV_ID).trim();
   const apiKey = String(process.env.CLOUDBASE_AI_API_KEY).trim();
   const modelId = String(process.env.CLOUDBASE_AI_MODEL).trim();
-  const timeoutMs = Math.min(15000, Math.max(2000, Number(process.env.CLOUDBASE_AI_TIMEOUT_MS || 12000)));
+  const timeoutMs = Math.min(9000, Math.max(2000, Number(process.env.CLOUDBASE_AI_TIMEOUT_MS || 7000)));
   const url = `https://${envId}.api.tcloudbasegateway.com/v1/ai/cloudbase/chat/completions`;
 
   const prompt = [
@@ -92,6 +92,7 @@ async function modelIntents(text='') {
     `用户输入：${String(text).slice(0, 200)}`
   ].join('\n');
 
+  const startedAt = Date.now();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -103,6 +104,7 @@ async function modelIntents(text='') {
       },
       body: JSON.stringify({
         model: modelId,
+        reasoning_effort: 'none',
         messages: [
           { role: 'system', content: '严格输出 JSON，不输出 Markdown，不输出诊断或建议。' },
           { role: 'user', content: prompt }
@@ -135,7 +137,9 @@ async function modelIntents(text='') {
   } catch (e) {
     console.warn('[HEALTOOLS AI] CloudBase AI fallback', {
       name: e?.name || 'Error',
-      message: String(e?.message || e).slice(0, 240)
+      message: String(e?.message || e).slice(0, 240),
+      elapsed_ms: Date.now() - startedAt,
+      timeout_ms: timeoutMs
     });
     return null;
   } finally {
