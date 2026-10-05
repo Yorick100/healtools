@@ -14,7 +14,7 @@
 CLOUDBASE_AI_ENV_ID=<CloudBase AI 环境 ID>
 CLOUDBASE_AI_API_KEY=<CloudBase 环境的服务端 API Key>
 CLOUDBASE_AI_MODEL=hy3
-CLOUDBASE_AI_TIMEOUT_MS=8000
+CLOUDBASE_AI_TIMEOUT_MS=12000
 HEALTOOLS_AI_ENABLED=1
 ```
 
@@ -33,3 +33,10 @@ HEALTOOLS_AUDIO_BASE_URL=https://7072-prod-d3g9016l9d91b1c0a-1499218047.tcb.qclo
 2. `POST /ai/recommend`，使用不含固定关键词的自然表达。
 3. 成功时：`provider = cloudbase_ai`, `fallback = false`。
 4. 失败时：自动回退 `deterministic_v040`，并在云托管日志打印不含密钥和用户原文的错误摘要。
+
+
+## Hotfix 1 (2026-10-06)
+- 修复 `/system/ping` 中未限定调用 `aiConfigured()` 导致的 500。
+- AI 配置缺失时输出不含密钥的诊断日志。
+- AI intent JSON 解析更稳健。
+- 默认 AI 超时改为 12 秒；生产环境建议 `CLOUDBASE_AI_TIMEOUT_MS=12000`。

@@ -24,7 +24,7 @@ async function requireUser(req,res,next) {
 function readAudioFiles() { try { return JSON.parse(fs.readFileSync(path.join(__dirname,'..','config','audio-files.json'),'utf8')); } catch (_) { return {}; } }
 
 function register(app) {
-  app.get('/system/ping', (req,res)=>res.json({ok:true,server_time:new Date().toISOString(),service:'healtools-cloudrun',version:'0.4.1',ai_enabled:aiConfigured(),ai_provider:aiConfigured()?'cloudbase_http':'deterministic_v040'}));
+  app.get('/system/ping', (req,res)=>{ const ready=ai.aiConfigured(); res.json({ok:true,server_time:new Date().toISOString(),service:'healtools-cloudrun',version:'0.4.1',ai_enabled:ready,ai_provider:ready?'cloudbase_http':'deterministic_v040',ai_model:process.env.CLOUDBASE_AI_MODEL||null}); });
   app.get('/content/config', (req,res)=>res.json({
     config_version:4,
     min_app_version:'0.4.0',

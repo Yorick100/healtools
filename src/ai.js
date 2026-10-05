@@ -24,13 +24,49 @@ function aiConfigured() {
     && !!process.env.CLOUDBASE_AI_MODEL;
 }
 
+function aiConfigDiagnostics() {
+  return {
+    enabled_flag: process.env.HEALTOOLS_AI_ENABLED !== '0',
+    env_id_set: !!String(process.env.CLOUDBASE_AI_ENV_ID || '').trim(),
+    api_key_set: !!String(process.env.CLOUDBASE_AI_API_KEY || '').trim(),
+    model: String(process.env.CLOUDBASE_AI_MODEL || '').trim() || null
+  };
+}
+
+function parseIntentPayload(rawValue) {
+  const raw = String(rawValue || '')
+    .trim()
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
+  if (!raw) throw new Error('AI response content is empty');
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (_) {
+    const start = raw.indexOf('{');
+    const end = raw.lastIndexOf('}');
+    if (start < 0 || end <= start) throw new Error('AI response is not valid JSON');
+    parsed = JSON.parse(raw.slice(start, end + 1));
+  }
+  if (!Array.isArray(parsed?.intents)) throw new Error('AI response missing intents array');
+  return parsed.intents
+    .map(x => String(x))
+    .filter((x, i, a) => INTENTS.includes(x) && a.indexOf(x) === i);
+}
+
 async function modelIntents(text='') {
-  if (!aiConfigured() || !String(text).trim()) return null;
+  if (!String(text).trim()) return null;
+  if (!aiConfigured()) {
+    console.warn('[HEALTOOLS AI] AI not configured; deterministic fallback', aiConfigDiagnostics());
+    return null;
+  }
 
   const envId = String(process.env.CLOUDBASE_AI_ENV_ID).trim();
   const apiKey = String(process.env.CLOUDBASE_AI_API_KEY).trim();
   const modelId = String(process.env.CLOUDBASE_AI_MODEL).trim();
-  const timeoutMs = Math.min(15000, Math.max(2000, Number(process.env.CLOUDBASE_AI_TIMEOUT_MS || 8000)));
+  const timeoutMs = Math.min(15000, Math.max(2000, Number(process.env.CLOUDBASE_AI_TIMEOUT_MS || 12000)));
   const url = `https://${envId}.api.tcloudbasegateway.com/v1/ai/cloudbase/chat/completions`;
 
   const prompt = [
@@ -70,16 +106,7 @@ async function modelIntents(text='') {
     }
 
     const result = await response.json();
-    const raw = String(result?.choices?.[0]?.message?.content || '')
-      .trim()
-      .replace(/^```(?:json)?/i, '')
-      .replace(/```$/i, '')
-      .trim();
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed.intents)) return null;
-    return parsed.intents
-      .map(x => String(x))
-      .filter((x, i, a) => INTENTS.includes(x) && a.indexOf(x) === i);
+    return parseIntentPayload(result?.choices?.[0]?.message?.content);
   } catch (e) {
     console.warn('[HEALTOOLS AI] CloudBase AI fallback', {
       name: e?.name || 'Error',
@@ -136,4 +163,4 @@ async function recommend({ quickIntents=[], text='', light=false, maxCards=3, lo
   return { actions, intents, time_context: ctx, provider: Array.isArray(aiIntents) ? 'cloudbase_ai' : 'deterministic_v040', fallback: !Array.isArray(aiIntents) };
 }
 
-module.exports = { INTENTS, ACTIONS, infer, hitsSafetyBoundary, recommend, aiConfigured };
+module.exports = { INTENTS, ACTIONS, infer, hitsSafetyBoundary, recommend, aiConfigured, aiConfigDiagnostics };
