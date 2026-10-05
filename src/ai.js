@@ -1,5 +1,3 @@
-const { cloudbaseApp } = require('./cloudbase');
-
 const INTENTS = ['energize','annoyed','stressed','relax','focus','sleep'];
 
 function infer(text='') {
@@ -19,34 +17,78 @@ function hitsSafetyBoundary(text='') {
   return /胸痛|呼吸困难|喘不上气|昏厥|晕倒|意识不清|大量出血|抽搐|中毒|自杀|自残|想死|药物过量|过量服药|急救/u.test(String(text || '').slice(0, 200));
 }
 
+function aiConfigured() {
+  return process.env.HEALTOOLS_AI_ENABLED !== '0'
+    && !!process.env.CLOUDBASE_AI_ENV_ID
+    && !!process.env.CLOUDBASE_AI_API_KEY
+    && !!process.env.CLOUDBASE_AI_MODEL;
+}
+
 async function modelIntents(text='') {
-  if (process.env.HEALTOOLS_AI_ENABLED === '0') return null;
-  const modelId = process.env.CLOUDBASE_AI_MODEL;
-  const app = cloudbaseApp();
-  if (!app || !modelId || !String(text).trim()) return null;
+  if (!aiConfigured() || !String(text).trim()) return null;
+
+  const envId = String(process.env.CLOUDBASE_AI_ENV_ID).trim();
+  const apiKey = String(process.env.CLOUDBASE_AI_API_KEY).trim();
+  const modelId = String(process.env.CLOUDBASE_AI_MODEL).trim();
+  const timeoutMs = Math.min(15000, Math.max(2000, Number(process.env.CLOUDBASE_AI_TIMEOUT_MS || 8000)));
+  const url = `https://${envId}.api.tcloudbasegateway.com/v1/ai/cloudbase/chat/completions`;
+
+  const prompt = [
+    '你是康䇿工具箱的“状态理解器”，不是医生。',
+    '只把用户的日常状态映射到允许的 intent，不做诊断，不解释原因，不给治疗建议。',
+    `允许值只有：${INTENTS.join(', ')}。`,
+    '必须只返回 JSON，例如 {"intents":["stressed","sleep"]}。',
+    '如果无法判断，返回 {"intents":[]}。',
+    `用户输入：${String(text).slice(0, 200)}`
+  ].join('\n');
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const ai = app.ai();
-    const model = ai.createModel('cloudbase');
-    const prompt = [
-      '你是康䇿工具箱的“状态理解器”，不是医生。',
-      '只把用户的日常状态映射到允许的 intent，不做诊断，不解释原因，不给治疗建议。',
-      `允许值只有：${INTENTS.join(', ')}。`,
-      '必须只返回 JSON，例如 {"intents":["stressed","sleep"]}。',
-      '如果无法判断，返回 {"intents":[]}。',
-      `用户输入：${String(text).slice(0, 200)}`
-    ].join('\n');
-    const result = await model.generateText({
-      model: modelId,
-      messages: [
-        { role: 'system', content: '严格输出 JSON，不输出 Markdown，不输出诊断或建议。' },
-        { role: 'user', content: prompt }
-      ]
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: modelId,
+        messages: [
+          { role: 'system', content: '严格输出 JSON，不输出 Markdown，不输出诊断或建议。' },
+          { role: 'user', content: prompt }
+        ],
+        stream: false,
+        temperature: 0,
+        max_tokens: 100
+      }),
+      signal: controller.signal
     });
-    const raw = String(result && result.text || '').trim().replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim();
+
+    if (!response.ok) {
+      const errText = await response.text().catch(() => '');
+      throw new Error(`HTTP ${response.status}${errText ? `: ${errText.slice(0, 160)}` : ''}`);
+    }
+
+    const result = await response.json();
+    const raw = String(result?.choices?.[0]?.message?.content || '')
+      .trim()
+      .replace(/^```(?:json)?/i, '')
+      .replace(/```$/i, '')
+      .trim();
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed.intents)) return null;
-    return parsed.intents.map(x => String(x)).filter((x, i, a) => INTENTS.includes(x) && a.indexOf(x) === i);
-  } catch (_) { return null; }
+    return parsed.intents
+      .map(x => String(x))
+      .filter((x, i, a) => INTENTS.includes(x) && a.indexOf(x) === i);
+  } catch (e) {
+    console.warn('[HEALTOOLS AI] CloudBase AI fallback', {
+      name: e?.name || 'Error',
+      message: String(e?.message || e).slice(0, 240)
+    });
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 const ACTIONS = {
@@ -94,4 +136,4 @@ async function recommend({ quickIntents=[], text='', light=false, maxCards=3, lo
   return { actions, intents, time_context: ctx, provider: Array.isArray(aiIntents) ? 'cloudbase_ai' : 'deterministic_v040', fallback: !Array.isArray(aiIntents) };
 }
 
-module.exports = { INTENTS, ACTIONS, infer, hitsSafetyBoundary, recommend };
+module.exports = { INTENTS, ACTIONS, infer, hitsSafetyBoundary, recommend, aiConfigured };
