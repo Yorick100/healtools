@@ -33,6 +33,20 @@ function aiConfigDiagnostics() {
   };
 }
 
+function extractMessageContent(message) {
+  const content = message?.content;
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content.map(part => {
+      if (typeof part === 'string') return part;
+      if (typeof part?.text === 'string') return part.text;
+      if (typeof part?.content === 'string') return part.content;
+      return '';
+    }).join('');
+  }
+  return '';
+}
+
 function parseIntentPayload(rawValue) {
   const raw = String(rawValue || '')
     .trim()
@@ -93,9 +107,7 @@ async function modelIntents(text='') {
           { role: 'system', content: '严格输出 JSON，不输出 Markdown，不输出诊断或建议。' },
           { role: 'user', content: prompt }
         ],
-        stream: false,
-        temperature: 0,
-        max_tokens: 100
+        stream: false
       }),
       signal: controller.signal
     });
@@ -106,7 +118,20 @@ async function modelIntents(text='') {
     }
 
     const result = await response.json();
-    return parseIntentPayload(result?.choices?.[0]?.message?.content);
+    const choice = result?.choices?.[0] || {};
+    const message = choice?.message || {};
+    const content = extractMessageContent(message);
+    if (!String(content || '').trim()) {
+      console.warn('[HEALTOOLS AI] CloudBase returned empty final content', {
+        finish_reason: choice?.finish_reason || null,
+        content_type: Array.isArray(message?.content) ? 'array' : typeof message?.content,
+        content_length: typeof content === 'string' ? content.length : 0,
+        reasoning_length: typeof message?.reasoning_content === 'string' ? message.reasoning_content.length : 0,
+        completion_tokens: result?.usage?.completion_tokens ?? null,
+        total_tokens: result?.usage?.total_tokens ?? null
+      });
+    }
+    return parseIntentPayload(content);
   } catch (e) {
     console.warn('[HEALTOOLS AI] CloudBase AI fallback', {
       name: e?.name || 'Error',
