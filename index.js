@@ -13,4 +13,4 @@ app.use((req,res)=>res.status(404).json({code:'not_found',message:'接口不存�
 app.use((err,req,res,next)=>{console.error(JSON.stringify({ts:new Date().toISOString(),request_id:req.requestId,error:String(err?.message||err),stack:process.env.NODE_ENV==='production'?undefined:err?.stack}));res.status(Number(err.status||500)).json({code:err.code||'service_error',message:Number(err.status||500)>=500?'服务暂时不可用':String(err.message||'请求失败'),data:{retryable:Number(err.status||500)>=500,request_id:req.requestId}});});
 
 const port=Number(process.env.PORT||80);
-(async()=>{try{if(process.env.AUTO_MIGRATE!=='0')await db.migrate();app.listen(port,'0.0.0.0',()=>console.log(`HEALTOOLS CloudRun v0.4.2 listening on ${port}`));}catch(e){console.error('startup failed',e);process.exit(1);}})();
+(async()=>{try{if(process.env.AUTO_MIGRATE!=='0')await db.migrate();app.listen(port,'0.0.0.0',()=>console.log(`HEALTOOLS CloudRun v0.4.3 listening on ${port}`));}catch(e){console.error('startup failed',e);process.exit(1);}})();

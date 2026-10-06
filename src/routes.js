@@ -20,9 +20,9 @@ async function requireUser(req,res,next) {
   } catch (e) { next(e); }
 }
 function register(app) {
-  app.get('/system/ping', (req,res)=>{ const ready=ai.aiConfigured(); res.json({ok:true,server_time:new Date().toISOString(),service:'healtools-cloudrun',version:'0.4.2',ai_enabled:ready,ai_provider:ready?'cloudbase_http':'deterministic_v040',ai_model:process.env.CLOUDBASE_AI_MODEL||null}); });
+  app.get('/system/ping', (req,res)=>{ const ready=ai.aiConfigured(); res.json({ok:true,server_time:new Date().toISOString(),service:'healtools-cloudrun',version:'0.4.3',ai_enabled:ready,ai_provider:ready?'cloudbase_http':'deterministic_v040',ai_model:process.env.CLOUDBASE_AI_MODEL||null}); });
   app.get('/content/config', (req,res)=>res.json({
-    config_version:5,
+    config_version:6,
     min_app_version:'0.4.0',
     quick_needs:[
       {key:'energize',title:'想提提神'},{key:'annoyed',title:'有点烦'},{key:'stressed',title:'压力有点大'},
@@ -42,8 +42,59 @@ function register(app) {
   app.put('/me/profile', requireUser, async (req,res,next)=>{ try { const nickname=String(req.body?.nickname||'').trim(); if(!nickname || [...nickname].length>20)return fail(res,400,'validation_error','昵称需为 1–20 个字符'); await db.query(`INSERT INTO healtools_user_profiles(user_id,nickname,server_version,updated_at) VALUES(?,?,1,UTC_TIMESTAMP()) ON DUPLICATE KEY UPDATE nickname=VALUES(nickname),server_version=server_version+1,updated_at=UTC_TIMESTAMP()`,[req.htUser.id,nickname]); res.json({profile:await domain.profile(req.htUser.id)}); }catch(e){next(e);} });
   app.put('/me/routine', requireUser, async (req,res,next)=>{ try { const wake=String(req.body?.usual_wake_time||'07:30').slice(0,5),sleep=String(req.body?.usual_sleep_time||'23:30').slice(0,5),tz=String(req.body?.timezone||'Asia/Shanghai'); if(!DateTime.now().setZone(tz).isValid)return fail(res,400,'validation_error','timezone 必须为有效 IANA 时区'); await db.query(`INSERT INTO healtools_user_routines(user_id,usual_wake_time,usual_sleep_time,timezone,server_version,updated_at) VALUES(?,?,?,?,1,UTC_TIMESTAMP()) ON DUPLICATE KEY UPDATE usual_wake_time=VALUES(usual_wake_time),usual_sleep_time=VALUES(usual_sleep_time),timezone=VALUES(timezone),server_version=server_version+1,updated_at=UTC_TIMESTAMP()`,[req.htUser.id,wake,sleep,tz]); res.json({routine:await domain.routine(req.htUser.id),effective_from:'next_health_day'}); }catch(e){next(e);} });
 
-  app.get('/today', requireUser, async (req,res,next)=>{ try { const u=req.htUser,h=await domain.healthDate(u.id),rows=await domain.ensurePlan(u.id),sum=await domain.starSummary(u.id),history=await domain.recentHealthContext(u.id);res.json({server_time:new Date().toISOString(),health_date:h.health_date,timezone:h.timezone,plan_id:rows[0]?.plan_id||'',...sum,morning_review:{needed:!history.sleep?.available,sleep_date:history.yesterday},cards:domain.apiCards(rows),config_version:5}); }catch(e){next(e);} });
-  app.post('/ai/recommend', requireUser, async (req,res,next)=>{ try { const u=req.htUser,text=String(req.body?.text||'').trim().slice(0,200),quick=Array.isArray(req.body?.quick_intents)?req.body.quick_intents.slice(0,6):[]; if(ai.hitsSafetyBoundary(text)){await domain.usageEvent(u.id,'ai_safety_boundary',{health_date:(await domain.healthDate(u.id)).health_date});return fail(res,422,'ai_safety_boundary','这类情况不适合用日常行动卡处理；如存在紧急或严重不适，请尽快寻求专业医疗帮助。');} const h=await domain.healthDate(u.id);await domain.usageEvent(u.id,'ai_prompt_submit',{health_date:h.health_date,quick_count:quick.length,has_text:text?1:0});const history=await domain.recentHealthContext(u.id);const rec=await ai.recommend({quickIntents:quick,text,light:!!req.body?.light_day,maxCards:Number(req.body?.max_cards||3),localHour:h.localHour,history});const rows=await domain.applyPlan(u.id,rec.actions,!!req.body?.light_day,rec.provider,{quick_intents:rec.intents,history_used:rec.history_used?1:0});await domain.usageEvent(u.id,'ai_recommend_success',{health_date:h.health_date,card_count:rows.length,fallback:rec.fallback?1:0,provider:rec.provider,history_used:rec.history_used?1:0});res.json({plan_id:rows[0]?.plan_id||'',cards:domain.apiCards(rows),fallback:rec.fallback,provider:rec.provider,history_used:!!rec.history_used,...(await domain.starSummary(u.id)),server_time:new Date().toISOString()}); }catch(e){next(e);} });
+  app.get('/today', requireUser, async (req,res,next)=>{ try { const u=req.htUser,h=await domain.healthDate(u.id),rows=await domain.ensurePlan(u.id),sum=await domain.starSummary(u.id),history=await domain.recentHealthContext(u.id);res.json({server_time:new Date().toISOString(),health_date:h.health_date,timezone:h.timezone,plan_id:rows[0]?.plan_id||'',...sum,morning_review:{needed:!history.sleep?.available,sleep_date:history.yesterday},cards:domain.apiCards(rows),config_version:6}); }catch(e){next(e);} });
+  app.post('/ai/recommend', requireUser, async (req,res,next)=>{
+    try {
+      const u=req.htUser;
+      const text=String(req.body?.text||'').trim().slice(0,200);
+      const quick=Array.isArray(req.body?.quick_intents)?req.body.quick_intents.slice(0,6):[];
+      const replan=!!req.body?.replan;
+      if(ai.hitsSafetyBoundary(text)){
+        await domain.usageEvent(u.id,'ai_safety_boundary',{health_date:(await domain.healthDate(u.id)).health_date});
+        return fail(res,422,'ai_safety_boundary','这类情况不适合用日常行动卡处理；如存在紧急或严重不适，请尽快寻求专业医疗帮助。');
+      }
+      const h=await domain.healthDate(u.id);
+      const existing=await domain.currentCards(u.id,h.health_date);
+      const completedCount=existing.filter(x=>x.status==='completed').length;
+      const remainingNeeded=replan && completedCount>0 && completedCount<existing.length ? existing.length-completedCount : 0;
+      const excludeActionIds=replan ? existing.map(x=>String(x.action_id||'')).filter(Boolean) : [];
+      await domain.usageEvent(u.id,'ai_prompt_submit',{health_date:h.health_date,quick_count:quick.length,has_text:text?1:0,replan:replan?1:0});
+      const history=await domain.recentHealthContext(u.id);
+      const rec=await ai.recommend({
+        quickIntents:quick,
+        text,
+        light:!!req.body?.light_day,
+        maxCards:Number(req.body?.max_cards||3),
+        minCards:remainingNeeded,
+        localHour:h.localHour,
+        history,
+        excludeActionIds
+      });
+      const rows=await domain.applyPlan(u.id,rec.actions,!!req.body?.light_day,rec.provider,{
+        quick_intents:rec.intents,
+        history_used:rec.history_used?1:0,
+        replan
+      });
+      await domain.usageEvent(u.id,'ai_recommend_success',{
+        health_date:h.health_date,
+        card_count:rows.length,
+        fallback:rec.fallback?1:0,
+        provider:rec.provider,
+        history_used:rec.history_used?1:0,
+        replan:replan?1:0
+      });
+      res.json({
+        plan_id:rows[0]?.plan_id||'',
+        cards:domain.apiCards(rows),
+        fallback:rec.fallback,
+        provider:rec.provider,
+        history_used:!!rec.history_used,
+        replan,
+        ...(await domain.starSummary(u.id)),
+        server_time:new Date().toISOString()
+      });
+    }catch(e){next(e);}
+  });
 
   for (const tool of ['breathing','meditation']) app.post(`/${tool}/sessions`,requireUser,async(req,res,next)=>{try{res.json(await domain.submitRecord(req.htUser.id,tool,req.body||{}));}catch(e){next(e);}});
   app.post('/diet/checkins',requireUser,async(req,res,next)=>{try{res.json(await domain.submitRecord(req.htUser.id,'diet',req.body||{}));}catch(e){next(e);}});

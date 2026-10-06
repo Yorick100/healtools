@@ -156,10 +156,11 @@ const ACTIONS = {
   emotion_quick_check: { action_id:'emotion_quick_check', title:'10 秒状态快记', desc:'用一两次点击记录此刻精力或压力。', tool:'emotion', mode:'quick_check', duration_sec:10 },
   sleep_morning_review: { action_id:'sleep_morning_review', title:'20 秒昨晚回顾', desc:'记录上床、起床和主观睡眠感受。', tool:'sleep', mode:'morning_review', duration_sec:20 }
 };
+const ALL_ACTION_IDS = Object.keys(ACTIONS);
 
 function timeContext(localHour) { if (localHour < 10) return 'morning'; if (localHour < 17) return 'day'; if (localHour < 21) return 'evening'; return 'night'; }
 
-async function recommend({ quickIntents=[], text='', light=false, maxCards=3, localHour=12, history=null }) {
+async function recommend({ quickIntents=[], text='', light=false, maxCards=3, minCards=0, localHour=12, history=null, excludeActionIds=[] }) {
   const intents = [];
   const addIntent = x => { if (INTENTS.includes(x) && !intents.includes(x)) intents.push(x); };
   quickIntents.forEach(addIntent);
@@ -173,15 +174,13 @@ async function recommend({ quickIntents=[], text='', light=false, maxCards=3, lo
 
   const ids = [];
   const add = id => { if (ACTIONS[id] && !ids.includes(id)) ids.push(id); };
-  if (intents.includes('sleep')) { add('meditation_sleep_180'); add('breathing_slow_exhale_180'); }
-  if (intents.includes('stressed')) { add('breathing_slow_exhale_60'); add('meditation_mindful_300'); }
-  if (intents.includes('annoyed')) { add('breathing_slow_exhale_60'); add('meditation_mindful_300'); }
-  if (intents.includes('relax')) { add(light ? 'breathing_slow_exhale_60' : 'breathing_slow_exhale_180'); add('meditation_mindful_300'); }
-  if (intents.includes('focus')) { add('breathing_slow_exhale_60'); add('emotion_quick_check'); }
-  if (intents.includes('energize')) { add('breathing_slow_exhale_60'); add('emotion_quick_check'); }
+  if (intents.includes('sleep')) { add('meditation_sleep_180'); add('breathing_slow_exhale_180'); add('breathing_slow_exhale_60'); }
+  if (intents.includes('stressed')) { add('breathing_slow_exhale_60'); add('meditation_mindful_300'); add('breathing_slow_exhale_180'); }
+  if (intents.includes('annoyed')) { add('breathing_slow_exhale_60'); add('meditation_mindful_300'); add('emotion_quick_check'); }
+  if (intents.includes('relax')) { add(light ? 'breathing_slow_exhale_60' : 'breathing_slow_exhale_180'); add('meditation_mindful_300'); add('emotion_quick_check'); }
+  if (intents.includes('focus')) { add('breathing_slow_exhale_60'); add('emotion_quick_check'); add('meditation_mindful_300'); }
+  if (intents.includes('energize')) { add('breathing_slow_exhale_60'); add('emotion_quick_check'); add('diet_dinner_quick'); }
 
-  // 历史信息只做“弱排序/补充”，不覆盖用户此刻明确表达的状态。
-  // 睡眠记录提示需要轻一点时，优先短呼吸；下午/晚间有持续饮食节奏提示时，可补一个快速晚餐计划。
   let historyAdds = 0;
   if (sleepGentle) {
     add('breathing_slow_exhale_60'); historyAdds++;
@@ -195,12 +194,21 @@ async function recommend({ quickIntents=[], text='', light=false, maxCards=3, lo
     else if (ctx === 'night') add('meditation_sleep_180');
     else add('breathing_slow_exhale_60');
   }
+  // “重新规划”需要尽量换卡；其余白名单动作仅作为安全备选，不改变可执行动作边界。
+  ALL_ACTION_IDS.forEach(add);
 
   let count = Math.min(3, Math.max(1, intents.length || (historyAdds > 1 ? 2 : 1)));
-  if (intents.length >= 2 && ids.length >= 2) count = 2;
-  if (intents.length >= 3 && ids.length >= 3) count = 3;
+  if (intents.length >= 2) count = Math.max(count, 2);
+  if (intents.length >= 3) count = 3;
   if (light) count = Math.min(count, 2);
-  count = Math.min(count, Math.max(1, Math.min(3, Number(maxCards || 3))), ids.length);
+  count = Math.min(count, Math.max(1, Math.min(3, Number(maxCards || 3))));
+  count = Math.max(count, Math.min(3, Math.max(0, Number(minCards || 0))));
+
+  const excluded = new Set((Array.isArray(excludeActionIds) ? excludeActionIds : []).map(String));
+  let candidates = ids.filter(id => !excluded.has(id));
+  // 理论上 7 个白名单动作足够支撑 1–3 张不同卡；若未来白名单缩小，才允许回退到旧动作。
+  if (candidates.length < count) candidates = candidates.concat(ids.filter(id => excluded.has(id)));
+  const picked = candidates.slice(0, count);
 
   const labels = { energize:'想提提神', annoyed:'有点烦', stressed:'压力有点大', relax:'想放松', focus:'想专注一下', sleep:'准备睡觉' };
   const basis = intents.length ? intents.map(x => labels[x] || x).join('、') : '当前时间';
@@ -208,7 +216,7 @@ async function recommend({ quickIntents=[], text='', light=false, maxCards=3, lo
   if (sleepGentle) historyBasis.push('最近的睡眠记录');
   if (dietAttention) historyBasis.push('最近的饮食记录');
 
-  const actions = ids.slice(0, count).map(id => {
+  const actions = picked.map(id => {
     let reason = `根据你现在的“${basis}”，先安排这件容易开始的小事。`;
     if (historyBasis.length && ['breathing_slow_exhale_60','breathing_slow_exhale_180','meditation_sleep_180','diet_dinner_quick'].includes(id)) {
       reason = `结合你现在的“${basis}”和${historyBasis.join('、')}，先安排一个更低负担、容易开始的行动。`;

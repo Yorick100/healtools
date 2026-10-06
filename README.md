@@ -1,49 +1,35 @@
-# 康䇿工具箱 HEALTOOLS CloudRun v0.4.0
+# 康䇿工具箱 HEALTOOLS CloudRun v0.4.3
 
-这是 v0.4.0 的微信云原生后端，替代 sparkpos.cn / WordPress 插件作为小程序运行时云端。
+v0.4.3 是微信云托管稳定后端。小程序通过 `wx.cloud.callContainer` 调用本服务；MySQL 保存用户、推荐卡、五类工具记录、星星和同步事实；公共音频从微信云托管对象存储读取；CloudBase AI+ 只做有限 intent 理解。
 
-## 架构
+## v0.4.3 重点
 
-- 小程序通过 `wx.cloud.callContainer` 调用微信云托管，不再依赖 `request` 合法域名，也不再向客户端下发自定义 access/refresh token。
-- 微信云托管注入的 `x-wx-openid` / `x-wx-appid` 作为可信身份入口，后端映射到 HEALTOOLS `user_uuid`。
-- 云托管 MySQL 保存用户、推荐卡、五类工具记录、星星、同步与埋点，是行为事实的权威存储。
-- CloudBase AI+ 只把自由文本映射到有限 intent；真正可执行动作仍由服务端 Action Library 白名单决定。
-- 音频放 CloudBase 对象存储；`scripts/upload-audio.js` 批量上传并生成 `config/audio-files.json`。
-- `/admin` 保留轻量统计面板；由 Basic Auth 环境变量保护。
+- 保留 `hy3 + reasoning_effort:none` 的低延迟 AI intent 路由，超时自动降级到确定性规则。
+- `POST /ai/recommend` 新增 `replan` 语义。重新规划时会排除当前轮 action，尽量给出不同白名单卡片。
+- 有部分已完成卡时继续保留完成卡，只替换未完成卡；当前轮全部完成后再次规划，会开启新的 `plan_id` 和新的 card_no。
+- 新轮 card_no 在同一健康日内不复用，因此额外完成的新卡可以继续安全加星；同一 card_no 仍通过 `award_key` 保证幂等，不重复发星。
+- 今日星星可超过初始推荐张数；客户端将“今天星星”和“本轮完成 X/N”分开展示。
+- 最近 7 天睡眠/饮食记录继续作为弱排序信号；历史不会覆盖用户此刻明确表达的状态。
+- `GET /daily-insight` 继续返回前一天睡眠/饮食的非医疗化生活方式提示。
+- `/system/ping` 版本为 `0.4.3`。
 
 ## 必需环境变量
 
-复制 `.env.example` 的键到微信云托管服务环境变量。真实数据库密码、腾讯云 SecretKey、管理员密码绝不能写入 Git。
-
-MySQL 地址使用控制台显示的内网地址。数据库建议把 `character_set_server` 改为 `utf8mb4` 并重启；本服务创建的表本身也固定使用 `utf8mb4`。
-
-## AI+
-
-1. 云开发控制台 → AI → 生文模型，开启要使用的模型。
-2. 把模型 ID 写入 `CLOUDBASE_AI_MODEL`。
-3. `CLOUDBASE_ENV_ID` 填云开发环境 ID。
-4. 独立 Node.js/云托管服务按官方 Node SDK 方式配置 `TENCENTCLOUD_SECRETID` / `TENCENTCLOUD_SECRETKEY`。
-5. `HEALTOOLS_AI_ENABLED=1`。
-
-AI 不可用、超时或未配置时，服务会自动退回 `deterministic_v040`，小程序仍能完整工作。
-
-## 音频对象存储
-
-把旧 release 中的 `HealTools_ServerAssets_v0.2.0.zip` 解压到本项目 `server_assets/v0.2.0/`，然后在本地：
-
-```bash
-npm install
-npm run upload:audio
+```text
+HEALTOOLS_AI_ENABLED=1
+CLOUDBASE_AI_ENV_ID=<CloudBase AI 环境 ID>
+CLOUDBASE_AI_API_KEY=<服务端 API Key>
+CLOUDBASE_AI_MODEL=hy3
+CLOUDBASE_AI_TIMEOUT_MS=7000
+HEALTOOLS_AUDIO_BASE_URL=https://...tcb.qcloud.la/healtools/audio/v0.4.0/
 ```
 
-脚本会生成 `config/audio-files.json`。该文件只包含 `cloud://` fileID，不包含密钥，可以提交到仓库。小程序启动时通过 `wx.cloud.getTempFileURL` 解析为可播放 URL。
+生产环境保持 `ALLOW_DEV_OPENID=0`。真实数据库密码、AI API Key、管理员密码不得提交 Git。
 
 ## 健康检查
 
-部署成功后：
-
 - `GET /system/ping`
-- 小程序真机通过 `wx.cloud.callContainer` 调用 `/auth/wechat`
-- 管理面板：`/admin`
-
-生产环境不要开启 `ALLOW_DEV_OPENID`。如果核心服务只由小程序调用，测试完成后建议关闭云托管公网访问；需要浏览器查看 `/admin` 时再临时打开公网，或后续把管理面板拆成单独的受控管理服务。
+- `POST /ai/recommend`
+- 第二次 `POST /ai/recommend` 携带 `replan:true`，确认 action 与当前轮不同
+- 完成整轮后再次规划，确认新 card_no 可继续加星
+- `GET /daily-insight`

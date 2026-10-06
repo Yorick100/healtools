@@ -168,22 +168,126 @@ function apiCards(rows) {
 
 async function currentCards(userId, hd) { return db.query(`SELECT * FROM healtools_daily_cards WHERE user_id=? AND health_date=? AND active=1 ORDER BY card_no`, [userId, hd]); }
 
+
 async function applyPlan(userId, actions, light, source, context={}) {
-  const h = await healthDate(userId); const hd = h.health_date; const existing = await currentCards(userId, hd); const completed = existing.filter(x => x.status === 'completed');
-  if (existing.length && completed.length === existing.length) return existing;
-  let target = Math.max(1, Math.min(3, actions.length || 1)); if (completed.length) target = existing.length;
-  const planId = uuid(), now = nowSql(); let next = 0;
-  await db.tx(async conn => {
-    for (let no=1; no<=target; no++) {
-      const old = existing.find(x => Number(x.card_no) === no);
-      if (old && old.status === 'completed') { await conn.execute(`UPDATE healtools_daily_cards SET plan_id=?,active=1,updated_at=? WHERE id=?`, [planId, now, old.id]); continue; }
-      const a = actions[next++] || actions[0]; if (!a) continue;
-      const snapshot = JSON.stringify({ quick_intents:context.quick_intents || [], light_day:!!light, history_used:!!context.history_used, timezone:h.timezone });
-      if (old) await conn.execute(`UPDATE healtools_daily_cards SET core_task_type=?,core_mode_id=?,action_id=?,title=?,duration_sec=?,reason_text=?,plan_id=?,source=?,active=1,light_mode=?,schedule_snapshot_json=?,status='open',completed_at=NULL,star_awarded=0,server_version=server_version+1,updated_at=? WHERE id=?`, [a.tool,a.mode,a.action_id,a.title,a.duration_sec,a.reason || '',planId,source,light?1:0,snapshot,now,old.id]);
-      else await conn.execute(`INSERT INTO healtools_daily_cards(user_id,health_date,card_no,core_task_type,core_mode_id,action_id,title,duration_sec,reason_text,plan_id,source,active,light_mode,schedule_snapshot_json,status,star_awarded,server_version,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,1,?,?, 'open',0,1,?,?)`, [userId,hd,no,a.tool,a.mode,a.action_id,a.title,a.duration_sec,a.reason || '',planId,source,light?1:0,snapshot,now,now]);
-    }
-    if (!completed.length) await conn.execute(`UPDATE healtools_daily_cards SET active=0,updated_at=? WHERE user_id=? AND health_date=? AND card_no>? AND status<>'completed'`, [now,userId,hd,target]);
+  const h = await healthDate(userId);
+  const hd = h.health_date;
+  const existing = await currentCards(userId, hd);
+  const completed = existing.filter(x => x.status === 'completed');
+  const allDone = existing.length > 0 && completed.length === existing.length;
+  const replan = !!context.replan;
+
+  if (allDone && !replan) return existing;
+
+  let target = Math.max(1, Math.min(3, actions.length || 1));
+  if (completed.length && !allDone) target = existing.length;
+
+  const planId = uuid();
+  const now = nowSql();
+  const snapshot = JSON.stringify({
+    quick_intents:context.quick_intents || [],
+    light_day:!!light,
+    history_used:!!context.history_used,
+    replan,
+    timezone:h.timezone
   });
+
+  await db.tx(async conn => {
+    const [mxRows] = await conn.execute(
+      `SELECT card_no FROM healtools_daily_cards WHERE user_id=? AND health_date=? ORDER BY card_no DESC LIMIT 1 FOR UPDATE`,
+      [userId, hd]
+    );
+    let maxNo = Number(mxRows?.[0]?.card_no || 0);
+
+    if (allDone && replan) {
+      if (maxNo + target > 120) return;
+      await conn.execute(
+        `UPDATE healtools_daily_cards SET active=0,updated_at=? WHERE user_id=? AND health_date=? AND active=1`,
+        [now, userId, hd]
+      );
+      for (let i=0; i<target; i++) {
+        const a = actions[i] || actions[0];
+        if (!a) continue;
+        if (maxNo >= 120) break;
+        const cardNo = ++maxNo;
+        await conn.execute(
+          `INSERT INTO healtools_daily_cards(user_id,health_date,card_no,core_task_type,core_mode_id,action_id,title,duration_sec,reason_text,plan_id,source,active,light_mode,schedule_snapshot_json,status,star_awarded,server_version,created_at,updated_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,1,?,?, 'open',0,1,?,?)`,
+          [userId,hd,cardNo,a.tool,a.mode,a.action_id,a.title,a.duration_sec,a.reason || '',planId,source,light?1:0,snapshot,now,now]
+        );
+      }
+      return;
+    }
+
+    if (existing.length) {
+      if (completed.length) {
+        let next = 0;
+        for (const old of existing) {
+          if (old.status === 'completed') {
+            await conn.execute(
+              `UPDATE healtools_daily_cards SET plan_id=?,active=1,updated_at=? WHERE id=?`,
+              [planId, now, old.id]
+            );
+            continue;
+          }
+          const a = actions[next++];
+          if (!a) {
+            await conn.execute(`UPDATE healtools_daily_cards SET plan_id=?,active=1,updated_at=? WHERE id=?`, [planId,now,old.id]);
+            continue;
+          }
+          await conn.execute(
+            `UPDATE healtools_daily_cards
+             SET core_task_type=?,core_mode_id=?,action_id=?,title=?,duration_sec=?,reason_text=?,plan_id=?,source=?,active=1,light_mode=?,schedule_snapshot_json=?,status='open',completed_at=NULL,star_awarded=0,server_version=server_version+1,updated_at=?
+             WHERE id=?`,
+            [a.tool,a.mode,a.action_id,a.title,a.duration_sec,a.reason || '',planId,source,light?1:0,snapshot,now,old.id]
+          );
+        }
+      } else {
+        const reusable = existing.slice(0, target);
+        for (let i=0; i<target; i++) {
+          const a = actions[i] || actions[0];
+          if (!a) continue;
+          const old = reusable[i];
+          if (old) {
+            await conn.execute(
+              `UPDATE healtools_daily_cards
+               SET core_task_type=?,core_mode_id=?,action_id=?,title=?,duration_sec=?,reason_text=?,plan_id=?,source=?,active=1,light_mode=?,schedule_snapshot_json=?,status='open',completed_at=NULL,star_awarded=0,server_version=server_version+1,updated_at=?
+               WHERE id=?`,
+              [a.tool,a.mode,a.action_id,a.title,a.duration_sec,a.reason || '',planId,source,light?1:0,snapshot,now,old.id]
+            );
+          } else {
+            if (maxNo >= 120) break;
+            const cardNo = ++maxNo;
+            await conn.execute(
+              `INSERT INTO healtools_daily_cards(user_id,health_date,card_no,core_task_type,core_mode_id,action_id,title,duration_sec,reason_text,plan_id,source,active,light_mode,schedule_snapshot_json,status,star_awarded,server_version,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,1,?,?, 'open',0,1,?,?)`,
+              [userId,hd,cardNo,a.tool,a.mode,a.action_id,a.title,a.duration_sec,a.reason || '',planId,source,light?1:0,snapshot,now,now]
+            );
+          }
+        }
+        const keepIds = new Set(reusable.map(x => Number(x.id)));
+        for (const old of existing) {
+          if (!keepIds.has(Number(old.id))) {
+            await conn.execute(`UPDATE healtools_daily_cards SET active=0,updated_at=? WHERE id=?`, [now, old.id]);
+          }
+        }
+      }
+      return;
+    }
+
+    for (let i=0; i<target; i++) {
+      const a = actions[i] || actions[0];
+      if (!a) continue;
+      if (maxNo >= 120) break;
+      const cardNo = ++maxNo;
+      await conn.execute(
+        `INSERT INTO healtools_daily_cards(user_id,health_date,card_no,core_task_type,core_mode_id,action_id,title,duration_sec,reason_text,plan_id,source,active,light_mode,schedule_snapshot_json,status,star_awarded,server_version,created_at,updated_at)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,1,?,?, 'open',0,1,?,?)`,
+        [userId,hd,cardNo,a.tool,a.mode,a.action_id,a.title,a.duration_sec,a.reason || '',planId,source,light?1:0,snapshot,now,now]
+      );
+    }
+  });
+
   return currentCards(userId, hd);
 }
 
@@ -201,34 +305,85 @@ function completed(tool, p) {
   return !!p.completed_at;
 }
 
+
 async function submitRecord(userId, tool, p) {
-  const record = String(p.record_id || ''); if (!/^[a-f0-9-]{36}$/i.test(record)) throw Object.assign(new Error('record_id 必须为 UUID'), { status:400, code:'validation_error' });
-  const exist = await db.one(`SELECT * FROM healtools_task_records WHERE record_uuid=?`, [record]); if (exist) return { record_id:record, server_version:Number(exist.server_version), task_status:exist.status, star_delta:0, duplicate:true, ...(await starSummary(userId)) };
-  const h = await healthDate(userId); const hd = String(p.health_date || h.health_date); const role = String(p.role || 'free'); const card = p.card_no ? Number(p.card_no) : null; const done = completed(tool, p); const late = done && role === 'core' && hd !== h.health_date; const now = nowSql();
+  const record = String(p.record_id || '');
+  if (!/^[a-f0-9-]{36}$/i.test(record)) throw Object.assign(new Error('record_id 必须为 UUID'), { status:400, code:'validation_error' });
+  const exist = await db.one(`SELECT * FROM healtools_task_records WHERE record_uuid=?`, [record]);
+  if (exist) return { record_id:record, server_version:Number(exist.server_version), task_status:exist.status, star_delta:0, duplicate:true, ...(await starSummary(userId)) };
+
+  const h = await healthDate(userId);
+  const hd = String(p.health_date || h.health_date);
+  const role = String(p.role || 'free');
+  const card = p.card_no ? Number(p.card_no) : null;
+  const done = completed(tool, p);
+  const late = done && role === 'core' && hd !== h.health_date;
+  const now = nowSql();
   let starDelta = 0, cardStatus = null;
+
   await db.tx(async conn => {
-    await conn.execute(`INSERT INTO healtools_task_records(record_uuid,user_id,health_date,card_no,tool_type,role,status,started_at,completed_at,client_created_at,client_updated_at,server_version,payload_json) VALUES(?,?,?,?,?,?,?,NULL,?,NULL,NULL,1,?)`, [record,userId,hd,card,tool,role,late?'late_record':done?'completed':'partial',done?now:null,JSON.stringify(p)]);
-    if (done && !late && role === 'core' && card >= 1 && card <= 3) {
-      let [rows] = await conn.execute(`SELECT * FROM healtools_daily_cards WHERE user_id=? AND health_date=? AND card_no=? AND active=1 FOR UPDATE`, [userId,hd,card]); let row = rows[0];
+    await conn.execute(
+      `INSERT INTO healtools_task_records(record_uuid,user_id,health_date,card_no,tool_type,role,status,started_at,completed_at,client_created_at,client_updated_at,server_version,payload_json)
+       VALUES(?,?,?,?,?,?,?,NULL,?,NULL,NULL,1,?)`,
+      [record,userId,hd,card,tool,role,late?'late_record':done?'completed':'partial',done?now:null,JSON.stringify(p)]
+    );
+
+    if (done && !late && role === 'core' && card >= 1 && card <= 120) {
+      let [rows] = await conn.execute(
+        `SELECT * FROM healtools_daily_cards WHERE user_id=? AND health_date=? AND card_no=? AND active=1 FOR UPDATE`,
+        [userId,hd,card]
+      );
+      let row = rows[0];
       const actionId = String(p.action_id || '');
+
       if ((!row || row.core_task_type !== tool) && ACTIONS[actionId]) {
         const a = ACTIONS[actionId], plan = row && row.plan_id ? row.plan_id : uuid();
-        if (row) await conn.execute(`UPDATE healtools_daily_cards SET core_task_type=?,core_mode_id=?,action_id=?,title=?,duration_sec=?,reason_text='由已批准的离线推荐卡恢复。',plan_id=?,source='client_approved_restore',active=1,status='open',updated_at=? WHERE id=?`, [a.tool,a.mode,a.action_id,a.title,a.duration_sec,plan,now,row.id]);
-        else await conn.execute(`INSERT INTO healtools_daily_cards(user_id,health_date,card_no,core_task_type,core_mode_id,action_id,title,duration_sec,reason_text,plan_id,source,active,light_mode,status,star_awarded,server_version,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,? ,?,'client_approved_restore',1,0,'open',0,1,?,?)`, [userId,hd,card,a.tool,a.mode,a.action_id,a.title,a.duration_sec,'由已批准的离线推荐卡恢复。',plan,now,now]);
-        [rows] = await conn.execute(`SELECT * FROM healtools_daily_cards WHERE user_id=? AND health_date=? AND card_no=? AND active=1 FOR UPDATE`, [userId,hd,card]); row = rows[0];
+        if (row) {
+          await conn.execute(
+            `UPDATE healtools_daily_cards
+             SET core_task_type=?,core_mode_id=?,action_id=?,title=?,duration_sec=?,reason_text='由已批准的离线推荐卡恢复。',plan_id=?,source='client_approved_restore',active=1,status='open',updated_at=?
+             WHERE id=?`,
+            [a.tool,a.mode,a.action_id,a.title,a.duration_sec,plan,now,row.id]
+          );
+        } else {
+          await conn.execute(
+            `INSERT INTO healtools_daily_cards(user_id,health_date,card_no,core_task_type,core_mode_id,action_id,title,duration_sec,reason_text,plan_id,source,active,light_mode,status,star_awarded,server_version,created_at,updated_at)
+             VALUES(?,?,?,?,?,?,?,?,?,?,'client_approved_restore',1,0,'open',0,1,?,?)`,
+            [userId,hd,card,a.tool,a.mode,a.action_id,a.title,a.duration_sec,'由已批准的离线推荐卡恢复。',plan,now,now]
+          );
+        }
+        [rows] = await conn.execute(
+          `SELECT * FROM healtools_daily_cards WHERE user_id=? AND health_date=? AND card_no=? AND active=1 FOR UPDATE`,
+          [userId,hd,card]
+        );
+        row = rows[0];
       }
+
       if (row && row.status !== 'completed' && row.core_task_type === tool) {
         const mode = String(p.mode_id || p.checkin_type || p.assessment_type || '');
         const modeOk = !mode || ['diet','emotion','sleep'].includes(tool) || row.core_mode_id === mode;
         if (modeOk) {
-          await conn.execute(`UPDATE healtools_daily_cards SET status='completed',completed_at=?,star_awarded=1,server_version=server_version+1,updated_at=? WHERE id=?`, [now,now,row.id]);
+          await conn.execute(
+            `UPDATE healtools_daily_cards SET status='completed',completed_at=?,star_awarded=1,server_version=server_version+1,updated_at=? WHERE id=?`,
+            [now,now,row.id]
+          );
           const award = `base:${userId}:${hd}:${card}`;
-          try { await conn.execute(`INSERT INTO healtools_star_ledger(ledger_uuid,user_id,health_date,card_no,delta,reason,award_key,source_record_uuid,created_at) VALUES(?,?,?,?,1,'recommended_card',?,?,?)`, [uuid(),userId,hd,card,award,record,now]); starDelta = 1; } catch (e) { if (e.code !== 'ER_DUP_ENTRY') throw e; }
+          try {
+            await conn.execute(
+              `INSERT INTO healtools_star_ledger(ledger_uuid,user_id,health_date,card_no,delta,reason,award_key,source_record_uuid,created_at)
+               VALUES(?,?,?,?,1,'recommended_card',?,?,?)`,
+              [uuid(),userId,hd,card,award,record,now]
+            );
+            starDelta = 1;
+          } catch (e) {
+            if (e.code !== 'ER_DUP_ENTRY') throw e;
+          }
           cardStatus = 'completed';
         }
       }
     }
   });
+
   return { record_id:record, server_version:1, task_status:late?'late_record':done?'completed':'partial', card_status:cardStatus, star_delta:starDelta, ...(await starSummary(userId)) };
 }
 
