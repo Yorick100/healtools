@@ -159,12 +159,17 @@ const ACTIONS = {
 
 function timeContext(localHour) { if (localHour < 10) return 'morning'; if (localHour < 17) return 'day'; if (localHour < 21) return 'evening'; return 'night'; }
 
-async function recommend({ quickIntents=[], text='', light=false, maxCards=3, localHour=12 }) {
+async function recommend({ quickIntents=[], text='', light=false, maxCards=3, localHour=12, history=null }) {
   const intents = [];
   const addIntent = x => { if (INTENTS.includes(x) && !intents.includes(x)) intents.push(x); };
   quickIntents.forEach(addIntent);
   const aiIntents = await modelIntents(text);
   if (Array.isArray(aiIntents)) aiIntents.forEach(addIntent); else infer(text).forEach(addIntent);
+
+  const ctx = timeContext(localHour);
+  const hist = history && typeof history === 'object' ? history : {};
+  const sleepGentle = !!hist?.signals?.sleep_gentle;
+  const dietAttention = !!hist?.signals?.diet_attention;
 
   const ids = [];
   const add = id => { if (ACTIONS[id] && !ids.includes(id)) ids.push(id); };
@@ -174,22 +179,43 @@ async function recommend({ quickIntents=[], text='', light=false, maxCards=3, lo
   if (intents.includes('relax')) { add(light ? 'breathing_slow_exhale_60' : 'breathing_slow_exhale_180'); add('meditation_mindful_300'); }
   if (intents.includes('focus')) { add('breathing_slow_exhale_60'); add('emotion_quick_check'); }
   if (intents.includes('energize')) { add('breathing_slow_exhale_60'); add('emotion_quick_check'); }
-  const ctx = timeContext(localHour);
+
+  // 历史信息只做“弱排序/补充”，不覆盖用户此刻明确表达的状态。
+  // 睡眠记录提示需要轻一点时，优先短呼吸；下午/晚间有持续饮食节奏提示时，可补一个快速晚餐计划。
+  let historyAdds = 0;
+  if (sleepGentle) {
+    add('breathing_slow_exhale_60'); historyAdds++;
+    if (ctx === 'night') add('meditation_sleep_180');
+  }
+  if (dietAttention && (ctx === 'evening' || ctx === 'night')) { add('diet_dinner_quick'); historyAdds++; }
+
   if (!ids.length) {
     if (ctx === 'morning') add('emotion_quick_check');
     else if (ctx === 'evening') add('diet_dinner_quick');
     else if (ctx === 'night') add('meditation_sleep_180');
     else add('breathing_slow_exhale_60');
   }
-  let count = Math.min(3, Math.max(1, intents.length || 1));
+
+  let count = Math.min(3, Math.max(1, intents.length || (historyAdds > 1 ? 2 : 1)));
   if (intents.length >= 2 && ids.length >= 2) count = 2;
   if (intents.length >= 3 && ids.length >= 3) count = 3;
   if (light) count = Math.min(count, 2);
   count = Math.min(count, Math.max(1, Math.min(3, Number(maxCards || 3))), ids.length);
+
   const labels = { energize:'想提提神', annoyed:'有点烦', stressed:'压力有点大', relax:'想放松', focus:'想专注一下', sleep:'准备睡觉' };
   const basis = intents.length ? intents.map(x => labels[x] || x).join('、') : '当前时间';
-  const actions = ids.slice(0, count).map(id => ({ ...ACTIONS[id], reason:`根据你现在的“${basis}”，先安排这件容易开始的小事。` }));
-  return { actions, intents, time_context: ctx, provider: Array.isArray(aiIntents) ? 'cloudbase_ai' : 'deterministic_v040', fallback: !Array.isArray(aiIntents) };
+  const historyBasis = [];
+  if (sleepGentle) historyBasis.push('最近的睡眠记录');
+  if (dietAttention) historyBasis.push('最近的饮食记录');
+
+  const actions = ids.slice(0, count).map(id => {
+    let reason = `根据你现在的“${basis}”，先安排这件容易开始的小事。`;
+    if (historyBasis.length && ['breathing_slow_exhale_60','breathing_slow_exhale_180','meditation_sleep_180','diet_dinner_quick'].includes(id)) {
+      reason = `结合你现在的“${basis}”和${historyBasis.join('、')}，先安排一个更低负担、容易开始的行动。`;
+    }
+    return { ...ACTIONS[id], reason };
+  });
+  return { actions, intents, time_context:ctx, provider:Array.isArray(aiIntents) ? 'cloudbase_ai' : 'deterministic_v040', fallback:!Array.isArray(aiIntents), history_used:historyBasis.length > 0 };
 }
 
 module.exports = { INTENTS, ACTIONS, infer, hitsSafetyBoundary, recommend, aiConfigured, aiConfigDiagnostics };

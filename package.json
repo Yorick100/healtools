@@ -1,14 +1,13 @@
 {
   "name": "healtools-cloudrun",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "private": true,
   "description": "康䇿工具箱 HEALTOOLS 微信云托管服务",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
     "check": "node --check index.js && node --check src/db.js && node --check src/cloudbase.js && node --check src/ai.js && node --check src/domain.js && node --check src/admin.js && node --check src/routes.js",
-    "migrate": "node scripts/migrate.js",
-    "upload:audio": "node scripts/upload-audio.js"
+    "migrate": "node scripts/migrate.js"
   },
   "engines": { "node": ">=18" },
   "dependencies": {
