@@ -317,15 +317,23 @@ async function submitRecord(userId, tool, p) {
   const role = String(p.role || 'free');
   const card = p.card_no ? Number(p.card_no) : null;
   const done = completed(tool, p);
-  const late = done && role === 'core' && hd !== h.health_date;
+  const startedDt = DateTime.fromISO(String(p.started_at || ''), { setZone:true });
+  const ageMin = startedDt.isValid ? DateTime.utc().diff(startedDt.toUTC(), 'minutes').minutes : Infinity;
+  const currentHd = DateTime.fromISO(h.health_date, { zone:h.timezone || 'Asia/Shanghai' });
+  const targetHd = DateTime.fromISO(hd, { zone:h.timezone || 'Asia/Shanghai' });
+  const adjacentHealthDay = currentHd.isValid && targetHd.isValid && Math.abs(currentHd.diff(targetHd, 'days').days) <= 1.01;
+  const boundaryGrace = role === 'core' && hd !== h.health_date && adjacentHealthDay && ageMin >= 0 && ageMin <= 120;
+  const late = done && role === 'core' && hd !== h.health_date && !boundaryGrace;
   const now = nowSql();
+  const toSqlTime = (v) => { const d=DateTime.fromISO(String(v||''),{setZone:true}); return d.isValid ? d.toUTC().toFormat('yyyy-LL-dd HH:mm:ss') : null; };
+  const startedSql=toSqlTime(p.started_at), clientCreatedSql=toSqlTime(p.client_created_at), clientUpdatedSql=toSqlTime(p.client_updated_at);
   let starDelta = 0, cardStatus = null;
 
   await db.tx(async conn => {
     await conn.execute(
       `INSERT INTO healtools_task_records(record_uuid,user_id,health_date,card_no,tool_type,role,status,started_at,completed_at,client_created_at,client_updated_at,server_version,payload_json)
-       VALUES(?,?,?,?,?,?,?,NULL,?,NULL,NULL,1,?)`,
-      [record,userId,hd,card,tool,role,late?'late_record':done?'completed':'partial',done?now:null,JSON.stringify(p)]
+       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [record,userId,hd,card,tool,role,late?'late_record':done?'completed':'partial',startedSql,done?now:null,clientCreatedSql,clientUpdatedSql,1,JSON.stringify(p)]
     );
 
     if (done && !late && role === 'core' && card >= 1 && card <= 120) {
