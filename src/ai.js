@@ -147,6 +147,109 @@ async function modelIntents(text='') {
   }
 }
 
+
+function extractJsonObject(rawValue) {
+  const raw = String(rawValue || '')
+    .trim()
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
+  if (!raw) throw new Error('AI response content is empty');
+  try { return JSON.parse(raw); }
+  catch (_) {
+    const start = raw.indexOf('{');
+    const end = raw.lastIndexOf('}');
+    if (start < 0 || end <= start) throw new Error('AI response is not valid JSON');
+    return JSON.parse(raw.slice(start, end + 1));
+  }
+}
+
+function safeLifestyleText(value, max=180) {
+  let t = String(value || '').replace(/\s+/g, ' ').trim().slice(0, max);
+  if (!t) return '';
+  // 日常生活方式提示不能越界到诊断、药物、治疗或风险预测。
+  if (/诊断|确诊|疾病|病症|药物|用药|处方|治疗|治愈|风险概率|患病概率|就医建议/u.test(t)) return '';
+  return t;
+}
+
+async function generateLifestyleInsight(ctx={}) {
+  if (!aiConfigured()) return null;
+  const hasSleep = !!ctx?.sleep?.available;
+  const hasDiet = !!ctx?.diet?.available;
+  if (!hasSleep && !hasDiet) return null;
+
+  const envId = String(process.env.CLOUDBASE_AI_ENV_ID).trim();
+  const apiKey = String(process.env.CLOUDBASE_AI_API_KEY).trim();
+  const modelId = String(process.env.CLOUDBASE_AI_MODEL).trim();
+  const timeoutMs = Math.min(9000, Math.max(2500, Number(process.env.CLOUDBASE_AI_TIMEOUT_MS || 7000)));
+  const url = `https://${envId}.api.tcloudbasegateway.com/v1/ai/cloudbase/chat/completions`;
+  const facts = {
+    based_on_date:ctx?.yesterday || '',
+    sleep: hasSleep ? {
+      quality:ctx.sleep.quality,
+      approx_hours:ctx.sleep.approx_hours,
+      sleep_latency_min:ctx.sleep.latency_min,
+      awakenings:ctx.sleep.awakenings,
+      bedtime_text:ctx.sleep.bedtime_text,
+      wake_time_text:ctx.sleep.wake_time_text
+    } : null,
+    diet: hasDiet ? {
+      meal_time_text:ctx.diet.meal_time_text,
+      regularity:ctx.diet.regularity,
+      plate:ctx.diet.plate,
+      night:ctx.diet.night
+    } : null
+  };
+  const prompt = [
+    '你是康䇿工具箱的 AI 健康顾问，只做非医疗的日常生活方式提示。',
+    '只能根据给出的用户记录写建议，不得补充或猜测未记录的信息。',
+    '不得诊断、评估疾病风险、推荐药物、处方或治疗。',
+    '建议要温和、具体、低负担，不制造焦虑，不使用绝对化语言。',
+    '必须只返回 JSON：{"sleep":"...","diet":"...","overall":"..."}。',
+    'sleep/diet 各不超过 90 个汉字；对应记录不存在时返回空字符串。overall 可为空，不超过 80 个汉字。',
+    `记录事实：${JSON.stringify(facts)}`
+  ].join('\n');
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const startedAt = Date.now();
+  try {
+    const response = await fetch(url, {
+      method:'POST',
+      headers:{'Authorization':`Bearer ${apiKey}`,'Content-Type':'application/json'},
+      body:JSON.stringify({
+        model:modelId,
+        reasoning_effort:'none',
+        messages:[
+          {role:'system',content:'严格输出 JSON；只做日常生活方式提示；不得诊断、治疗或推测未提供事实。'},
+          {role:'user',content:prompt}
+        ],
+        stream:false
+      }),
+      signal:controller.signal
+    });
+    if (!response.ok) {
+      const errText = await response.text().catch(()=>'');
+      throw new Error(`HTTP ${response.status}${errText ? `: ${errText.slice(0,160)}` : ''}`);
+    }
+    const result = await response.json();
+    const content = extractMessageContent(result?.choices?.[0]?.message || {});
+    const parsed = extractJsonObject(content);
+    const out = {
+      sleep:hasSleep ? safeLifestyleText(parsed?.sleep) : '',
+      diet:hasDiet ? safeLifestyleText(parsed?.diet) : '',
+      overall:safeLifestyleText(parsed?.overall, 140)
+    };
+    if ((hasSleep && !out.sleep) || (hasDiet && !out.diet)) throw new Error('AI daily insight missing required field');
+    return out;
+  } catch (e) {
+    console.warn('[HEALTOOLS AI] daily insight model fallback', {
+      name:e?.name || 'Error', message:String(e?.message || e).slice(0,220), elapsed_ms:Date.now()-startedAt, timeout_ms:timeoutMs
+    });
+    return null;
+  } finally { clearTimeout(timer); }
+}
+
 const ACTIONS = {
   breathing_slow_exhale_60: { action_id:'breathing_slow_exhale_60', title:'1 分钟舒适慢呼吸', desc:'把注意力放回呼吸，先做一个很小的启动。', tool:'breathing', mode:'slow_exhale', duration_sec:60 },
   breathing_slow_exhale_180: { action_id:'breathing_slow_exhale_180', title:'3 分钟舒适慢呼吸', desc:'用更长一点的呼气，让节奏慢下来。', tool:'breathing', mode:'slow_exhale', duration_sec:180 },
@@ -226,4 +329,4 @@ async function recommend({ quickIntents=[], text='', light=false, maxCards=3, mi
   return { actions, intents, time_context:ctx, provider:Array.isArray(aiIntents) ? 'cloudbase_ai' : 'deterministic_v040', fallback:!Array.isArray(aiIntents), history_used:historyBasis.length > 0 };
 }
 
-module.exports = { INTENTS, ACTIONS, infer, hitsSafetyBoundary, recommend, aiConfigured, aiConfigDiagnostics };
+module.exports = { INTENTS, ACTIONS, infer, hitsSafetyBoundary, recommend, aiConfigured, aiConfigDiagnostics, generateLifestyleInsight };

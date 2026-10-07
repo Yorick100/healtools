@@ -1,6 +1,6 @@
 {
   "name": "healtools-cloudrun",
-  "version": "0.4.4",
+  "version": "0.4.5",
   "private": true,
   "description": "康䇿工具箱 HEALTOOLS 微信云托管服务",
   "main": "index.js",

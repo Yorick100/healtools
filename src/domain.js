@@ -1,7 +1,7 @@
 const crypto = require('crypto');
 const { DateTime } = require('luxon');
 const db = require('./db');
-const { ACTIONS, recommend } = require('./ai');
+const { ACTIONS, recommend, generateLifestyleInsight } = require('./ai');
 
 const uuid = () => crypto.randomUUID();
 const nowSql = () => DateTime.utc().toFormat('yyyy-LL-dd HH:mm:ss');
@@ -54,7 +54,7 @@ async function recentHealthContext(userId) {
   const sleepRows = parsed.filter(r => r.tool_type === 'sleep' && Number(r.payload?.quality || 0) > 0);
   const dietRows = parsed.filter(r => r.tool_type === 'diet');
   const sleepYesterday = sleepRows.find(r => String(r.payload?.sleep_date || '') === yesterday) || null;
-  const dietYesterday = dietRows.find(r => String(r.health_date || '').slice(0,10) === yesterday) || null;
+  const dietYesterday = dietRows.find(r => String(r.health_date || '').slice(0,10) === yesterday && ['dinner','晚餐',''].includes(String(r.payload?.meal_type || ''))) || null;
   const recentSleep = sleepRows.slice(0,7);
   const recentDiet = dietRows.filter(r => String(r.health_date || '').slice(0,10) >= from).slice(0,14);
   const sleepQualities = recentSleep.map(r => Number(r.payload?.quality || 0)).filter(x => x >= 1 && x <= 5);
@@ -130,12 +130,79 @@ function dailyInsightFromContext(ctx) {
     health_date:ctx.health_date,
     based_on_date:ctx.yesterday,
     available:!!(s.available || d.available),
-    title:'昨天的睡眠与饮食提示',
+    title:'睡眠与饮食提示',
     items,
     note:'只根据你自己记录的生活方式信息做日常提示，不是医学诊断、风险预测或治疗建议。'
   };
 }
-async function dailyInsight(userId) { return dailyInsightFromContext(await recentHealthContext(userId)); }
+async function dailyInsight(userId) {
+  const ctx = await recentHealthContext(userId);
+  const insightDate = ctx.health_date;
+  const cached = await db.one(`SELECT provider,content_json,generated_at FROM healtools_daily_insights WHERE user_id=? AND insight_date=? LIMIT 1`, [userId, insightDate]);
+  const hasSourceData = !!(ctx.sleep?.available || ctx.diet?.available);
+  if (cached && cached.provider !== 'generating' && !(cached.provider === 'no_data' && hasSourceData)) {
+    const content = parsePayload(cached.content_json);
+    return { ...content, cached:true, provider:cached.provider, generated_at:cached.generated_at };
+  }
+
+  const now = nowSql();
+  let ownsGeneration = false;
+  if (!cached) {
+    const claim = await db.query(
+      `INSERT IGNORE INTO healtools_daily_insights(user_id,insight_date,based_on_date,provider,content_json,generated_at) VALUES(?,?,?,'generating','{}',?)`,
+      [userId, insightDate, ctx.yesterday, now]
+    );
+    ownsGeneration = Number(claim?.affectedRows || 0) > 0;
+  } else if (cached.provider === 'no_data' && hasSourceData) {
+    const claim = await db.query(
+      `UPDATE healtools_daily_insights SET provider='generating',based_on_date=?,content_json='{}',generated_at=? WHERE user_id=? AND insight_date=? AND provider='no_data'`,
+      [ctx.yesterday, now, userId, insightDate]
+    );
+    ownsGeneration = Number(claim?.affectedRows || 0) > 0;
+  }
+
+  if (!ownsGeneration) {
+    // 同一用户同一天只允许一个 AI 生成任务。并发请求等待短时间后读取缓存。
+    for (let i=0;i<32;i++) {
+      await new Promise(resolve => setTimeout(resolve, 250));
+      const row = await db.one(`SELECT provider,content_json,generated_at FROM healtools_daily_insights WHERE user_id=? AND insight_date=? LIMIT 1`, [userId, insightDate]);
+      if (row && row.provider !== 'generating') {
+        const content = parsePayload(row.content_json);
+        return { ...content, cached:true, provider:row.provider, generated_at:row.generated_at };
+      }
+    }
+    const fallback = dailyInsightFromContext(ctx);
+    return { ...fallback, cached:false, provider:'generating', generated_at:null };
+  }
+
+  let result = dailyInsightFromContext(ctx);
+  let provider = hasSourceData ? 'deterministic_v045' : 'no_data';
+  if (hasSourceData) {
+    try {
+      const generated = await generateLifestyleInsight(ctx);
+      if (generated) {
+        result = {
+          ...result,
+          items: result.items.map(item => {
+            if (item.type === 'sleep' && generated.sleep) return { ...item, text:generated.sleep };
+            if (item.type === 'diet' && generated.diet) return { ...item, text:generated.diet };
+            return item;
+          }),
+          ...(generated.overall ? { overall:generated.overall } : {})
+        };
+        provider = 'cloudbase_ai';
+      }
+    } catch (e) {
+      console.warn('[HEALTOOLS AI] daily insight fallback', { message:String(e?.message || e).slice(0,180) });
+    }
+  }
+  result = { ...result, title:'睡眠与饮食提示', generated_for_date:insightDate };
+  await db.query(
+    `UPDATE healtools_daily_insights SET based_on_date=?,provider=?,content_json=?,generated_at=? WHERE user_id=? AND insight_date=?`,
+    [ctx.yesterday, provider, JSON.stringify(result), nowSql(), userId, insightDate]
+  );
+  return { ...result, cached:false, provider, generated_at:new Date().toISOString() };
+}
 
 async function profile(userId) { return await db.one(`SELECT nickname,server_version FROM healtools_user_profiles WHERE user_id=?`, [userId]) || { nickname:null, server_version:1 }; }
 async function routine(userId) { return await db.one(`SELECT usual_wake_time,usual_sleep_time,timezone,server_version FROM healtools_user_routines WHERE user_id=?`, [userId]) || { usual_wake_time:'07:30:00', usual_sleep_time:'23:30:00', timezone:'Asia/Shanghai', server_version:1 }; }
@@ -144,10 +211,19 @@ async function healthDate(userId, now=DateTime.utc()) {
   const r = await routine(userId);
   const zone = r.timezone || 'Asia/Shanghai';
   let local = now.setZone(zone); if (!local.isValid) local = now.setZone('Asia/Shanghai');
-  const sleep = String(r.usual_sleep_time || '23:30').slice(0,5).split(':').map(Number);
-  const boundary = local.startOf('day').set({ hour:sleep[0] || 23, minute:sleep[1] || 30 }).plus({ minutes:120 });
-  const date = local < boundary ? local.minus({ days:1 }).toISODate() : local.toISODate();
-  return { health_date:date, timezone:local.zoneName, localHour:local.hour };
+  // v0.4.5 起，“今天”严格按用户当地日历日 00:00–23:59 计算。
+  // 作息时间仍用于推荐语境，但不再改变星星、计划和历史归属日期。
+  return { health_date:local.toISODate(), timezone:local.zoneName, localHour:local.hour };
+}
+
+async function syncTimezone(userId, zone) {
+  const z = String(zone || '').trim();
+  if (!z || !DateTime.now().setZone(z).isValid) return false;
+  const r = await db.query(
+    `UPDATE healtools_user_routines SET timezone=?,server_version=server_version+1,updated_at=UTC_TIMESTAMP() WHERE user_id=? AND timezone<>?`,
+    [z,userId,z]
+  );
+  return Number(r?.affectedRows || 0) > 0;
 }
 
 async function starSummary(userId) {
@@ -156,7 +232,7 @@ async function starSummary(userId) {
   const today = await db.one(`SELECT COALESCE(SUM(delta),0) n FROM healtools_star_ledger WHERE user_id=? AND health_date=?`, [userId, hd]);
   const week = await db.one(`SELECT COALESCE(SUM(delta),0) n FROM healtools_star_ledger WHERE user_id=? AND health_date>=?`, [userId, weekStart]);
   const total = await db.one(`SELECT COALESCE(SUM(delta),0) n FROM healtools_star_ledger WHERE user_id=?`, [userId]);
-  return { today_star:Number(today.n || 0), week_star:Number(week.n || 0), total_star:Number(total.n || 0) };
+  return { health_date:hd, today_star:Number(today.n || 0), week_star:Number(week.n || 0), total_star:Number(total.n || 0) };
 }
 
 function apiCards(rows) {
@@ -397,4 +473,4 @@ async function submitRecord(userId, tool, p) {
 
 async function usageEvent(userId, event, params={}) { await db.query(`INSERT INTO healtools_usage_events(user_id,event_name,health_date,params_json,created_at) VALUES(?,?,?,?,?)`, [userId || null,event,params.health_date || null,JSON.stringify(params || {}),nowSql()]); }
 
-module.exports = { uuid, nowSql, ensureUser, profile, routine, healthDate, starSummary, apiCards, currentCards, applyPlan, ensurePlan, submitRecord, usageEvent, recentHealthContext, dailyInsight };
+module.exports = { uuid, nowSql, ensureUser, profile, routine, healthDate, syncTimezone, starSummary, apiCards, currentCards, applyPlan, ensurePlan, submitRecord, usageEvent, recentHealthContext, dailyInsight };

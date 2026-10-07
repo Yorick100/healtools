@@ -131,6 +131,20 @@ CREATE TABLE IF NOT EXISTS healtools_usage_events (
   PRIMARY KEY(id), KEY idx_event_created(event_name,created_at), KEY idx_user_created(user_id,created_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+
+CREATE TABLE IF NOT EXISTS healtools_daily_insights (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  user_id BIGINT UNSIGNED NOT NULL,
+  insight_date DATE NOT NULL,
+  based_on_date DATE NOT NULL,
+  provider VARCHAR(32) NOT NULL DEFAULT 'deterministic_v045',
+  content_json LONGTEXT NOT NULL,
+  generated_at DATETIME NOT NULL,
+  PRIMARY KEY(id),
+  UNIQUE KEY uq_user_insight_date(user_id,insight_date),
+  KEY idx_insight_date(insight_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS healtools_settings (
   setting_key VARCHAR(80) NOT NULL,
   setting_value LONGTEXT NULL,
