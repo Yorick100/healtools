@@ -176,7 +176,8 @@ async function generateLifestyleInsight(ctx={}) {
   if (!aiConfigured()) return null;
   const hasSleep = !!ctx?.sleep?.available;
   const hasDiet = !!ctx?.diet?.available;
-  if (!hasSleep && !hasDiet) return null;
+  const hasEmotion = !!ctx?.emotion?.available;
+  if (!hasSleep && !hasDiet && !hasEmotion) return null;
 
   const envId = String(process.env.CLOUDBASE_AI_ENV_ID).trim();
   const apiKey = String(process.env.CLOUDBASE_AI_API_KEY).trim();
@@ -184,7 +185,7 @@ async function generateLifestyleInsight(ctx={}) {
   const timeoutMs = Math.min(9000, Math.max(2500, Number(process.env.CLOUDBASE_AI_TIMEOUT_MS || 7000)));
   const url = `https://${envId}.api.tcloudbasegateway.com/v1/ai/cloudbase/chat/completions`;
   const facts = {
-    based_on_date:ctx?.yesterday || '',
+    based_on_date:ctx?.based_on_date || ctx?.yesterday || '',
     sleep: hasSleep ? {
       quality:ctx.sleep.quality,
       approx_hours:ctx.sleep.approx_hours,
@@ -198,15 +199,16 @@ async function generateLifestyleInsight(ctx={}) {
       regularity:ctx.diet.regularity,
       plate:ctx.diet.plate,
       night:ctx.diet.night
-    } : null
+    } : null,
+    emotion: hasEmotion ? { energy:ctx.emotion.energy,stress:ctx.emotion.stress } : null
   };
   const prompt = [
     '你是康䇿工具箱的 AI 健康顾问，只做非医疗的日常生活方式提示。',
     '只能根据给出的用户记录写建议，不得补充或猜测未记录的信息。',
     '不得诊断、评估疾病风险、推荐药物、处方或治疗。',
     '建议要温和、具体、低负担，不制造焦虑，不使用绝对化语言。',
-    '必须只返回 JSON：{"sleep":"...","diet":"...","overall":"..."}。',
-    'sleep/diet 各不超过 90 个汉字；对应记录不存在时返回空字符串。overall 可为空，不超过 80 个汉字。',
+    '必须只返回 JSON：{"sleep":"...","diet":"...","emotion":"...","overall":"..."}。',
+    'sleep/diet/emotion 各不超过 90 个汉字；对应记录不存在时返回空字符串。overall 可为空，不超过 80 个汉字。',
     `记录事实：${JSON.stringify(facts)}`
   ].join('\n');
 
@@ -238,9 +240,10 @@ async function generateLifestyleInsight(ctx={}) {
     const out = {
       sleep:hasSleep ? safeLifestyleText(parsed?.sleep) : '',
       diet:hasDiet ? safeLifestyleText(parsed?.diet) : '',
+      emotion:hasEmotion ? safeLifestyleText(parsed?.emotion) : '',
       overall:safeLifestyleText(parsed?.overall, 140)
     };
-    if ((hasSleep && !out.sleep) || (hasDiet && !out.diet)) throw new Error('AI daily insight missing required field');
+    if ((hasSleep && !out.sleep) || (hasDiet && !out.diet) || (hasEmotion && !out.emotion)) throw new Error('AI daily insight missing required field');
     return out;
   } catch (e) {
     console.warn('[HEALTOOLS AI] daily insight model fallback', {

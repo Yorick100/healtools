@@ -4,6 +4,7 @@ const domain = require('./domain');
 const ai = require('./ai');
 const { cloudbaseApp } = require('./cloudbase');
 const { basicAuth, dashboard } = require('./admin');
+const {advisor}=require('./advisor');
 
 function fail(res, status, code, message, extra={}) { return res.status(status).json({ code, message, data:{ retryable:status>=500 || status===429, ...extra } }); }
 function identity(req) {
@@ -19,11 +20,14 @@ async function requireUser(req,res,next) {
     req.htUser = await domain.ensureUser(id.openid,id.appid,id.unionid);
     const tz = String(req.headers['x-healtools-timezone'] || '').trim();
     if (tz && DateTime.now().setZone(tz).isValid) await domain.syncTimezone(req.htUser.id, tz);
+    // Best-effort unique daily heartbeat; this should never block user requests.
+    const day=(await domain.healthDate(req.htUser.id)).health_date;
+    await db.query(`INSERT INTO healtools_user_daily_activity(user_id,activity_date,first_active_at,last_active_at,request_count) VALUES(?,?,UTC_TIMESTAMP(),UTC_TIMESTAMP(),1) ON DUPLICATE KEY UPDATE last_active_at=UTC_TIMESTAMP(),request_count=request_count+1`,[req.htUser.id,day]).catch(e=>console.warn('[activity]',e.message));
     next();
   } catch (e) { next(e); }
 }
 function register(app) {
-  app.get('/system/ping', (req,res)=>{ const ready=ai.aiConfigured(); res.json({ok:true,server_time:new Date().toISOString(),service:'healtools-cloudrun',version:'0.4.5',ai_enabled:ready,ai_provider:ready?'cloudbase_http':'deterministic_v040',ai_model:process.env.CLOUDBASE_AI_MODEL||null}); });
+  app.get('/system/ping', (req,res)=>{ const ready=ai.aiConfigured(); res.json({ok:true,server_time:new Date().toISOString(),service:'healtools-cloudrun',version:'0.4.6',ai_enabled:ready,ai_provider:ready?'cloudbase_http':'deterministic_v040',ai_model:process.env.CLOUDBASE_AI_MODEL||null}); });
   app.get('/content/config', (req,res)=>res.json({
     config_version:7,
     min_app_version:'0.4.0',
@@ -112,7 +116,7 @@ function register(app) {
     const tool_stats=await db.query(`SELECT tool_type,COUNT(*) total_count,SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) completed_count FROM healtools_task_records WHERE user_id=? AND health_date BETWEEN ? AND ? AND deleted_at IS NULL GROUP BY tool_type`,[uid,from,to]);
     res.json({from,to,stars,records,plans,tool_stats,server_time:new Date().toISOString()});
   }catch(e){next(e);}});
-  app.get('/daily-insight',requireUser,async(req,res,next)=>{try{res.json(await domain.dailyInsight(req.htUser.id));}catch(e){next(e);}});
+  app.get('/daily-insight',requireUser,async(req,res,next)=>{try{res.json(await advisor(req.htUser.id));}catch(e){next(e);}});
   app.get('/weekly-insight',requireUser,async(req,res,next)=>{try{const s=await domain.starSummary(req.htUser.id);res.json({week_start:DateTime.utc().startOf('week').toISODate(),insight:{code:'weekly_consistency',text:`本周已记录 ${s.week_star} 颗星。这只是行为记录，不代表医学健康水平。`,non_causal:true}});}catch(e){next(e);}});
 
   const resourceTool={breathing_session:'breathing',meditation_session:'meditation',diet_checkin:'diet',emotion_assessment:'emotion',sleep_diary:'sleep'};
@@ -120,7 +124,7 @@ function register(app) {
   app.post('/guest/merge',requireUser,async(req,res,next)=>{try{const rows=Array.isArray(req.body?.records)?req.body.records.slice(0,100):[];let merged=0,skipped=0,star_delta=0;for(const m of rows){const tool=resourceTool[String(m.resource||'')];if(!tool){skipped++;continue;}try{const r=await domain.submitRecord(req.htUser.id,tool,{...(m.payload||{}),record_id:m.record_id||(m.payload||{}).record_id});if(r.duplicate)skipped++;else merged++;star_delta+=Number(r.star_delta||0);}catch(_){skipped++;}}res.json({merged_records:merged,skipped_records:skipped,star_delta,...(await domain.starSummary(req.htUser.id))});}catch(e){next(e);}});
 
   app.post('/data-export',requireUser,async(req,res,next)=>{try{const uid=req.htUser.id,u=req.htUser;const data={exported_at:new Date().toISOString(),user_id:u.user_uuid,profile:await domain.profile(uid),routine:await domain.routine(uid),daily_cards:await db.query(`SELECT * FROM healtools_daily_cards WHERE user_id=? ORDER BY health_date,card_no`,[uid]),records:await db.query(`SELECT * FROM healtools_task_records WHERE user_id=? AND deleted_at IS NULL ORDER BY health_date`,[uid]),stars:await db.query(`SELECT * FROM healtools_star_ledger WHERE user_id=? ORDER BY created_at`,[uid]),daily_insights:await db.query(`SELECT * FROM healtools_daily_insights WHERE user_id=? ORDER BY insight_date`,[uid])};const cb=cloudbaseApp();if(!cb)return res.json({storage:false,data});const file=Buffer.from(JSON.stringify(data,null,2),'utf8'),cloudPath=`healtools/private/exports/${u.user_uuid}/${domain.uuid()}.json`;const up=await cb.uploadFile({cloudPath,fileContent:file});let url='';try{const x=await cb.getTempFileURL({fileList:[up.fileID]});url=x?.fileList?.[0]?.tempFileURL||'';}catch(_){}res.json({storage:true,file_id:up.fileID,download_url:url,expires_notice:'临时链接会过期，请及时下载。'});}catch(e){next(e);}});
-  app.delete('/me/data',requireUser,async(req,res,next)=>{try{if(String(req.body?.confirm||'')!=='DELETE')return fail(res,400,'confirmation_required','请提交 confirm=DELETE 以确认删除。');const uid=req.htUser.id;await db.tx(async conn=>{for(const t of ['healtools_consent_records','healtools_daily_cards','healtools_task_records','healtools_star_ledger','healtools_sync_changes','healtools_usage_events','healtools_daily_insights','healtools_user_profiles','healtools_user_routines','healtools_wechat_identities'])await conn.execute(`DELETE FROM ${t} WHERE user_id=?`,[uid]);await conn.execute(`DELETE FROM healtools_users WHERE id=?`,[uid]);});res.json({deleted:true,server_time:new Date().toISOString()});}catch(e){next(e);}});
+  app.delete('/me/data',requireUser,async(req,res,next)=>{try{if(String(req.body?.confirm||'')!=='DELETE')return fail(res,400,'confirmation_required','请提交 confirm=DELETE 以确认删除。');const uid=req.htUser.id;await db.tx(async conn=>{for(const t of ['healtools_consent_records','healtools_daily_cards','healtools_task_records','healtools_star_ledger','healtools_sync_changes','healtools_usage_events','healtools_daily_insights','healtools_advisor_insights','healtools_user_daily_activity','healtools_user_profiles','healtools_user_routines','healtools_wechat_identities'])await conn.execute(`DELETE FROM ${t} WHERE user_id=?`,[uid]);await conn.execute(`DELETE FROM healtools_users WHERE id=?`,[uid]);});res.json({deleted:true,server_time:new Date().toISOString()});}catch(e){next(e);}});
 
   app.get('/admin',basicAuth,dashboard);
 }

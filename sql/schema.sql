@@ -151,3 +151,15 @@ CREATE TABLE IF NOT EXISTS healtools_settings (
   updated_at DATETIME NOT NULL,
   PRIMARY KEY(setting_key)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+CREATE TABLE IF NOT EXISTS healtools_advisor_insights (
+ user_id BIGINT UNSIGNED NOT NULL, insight_date DATE NOT NULL, source_hash CHAR(64) NOT NULL,
+ provider VARCHAR(32) NOT NULL, content_json LONGTEXT NOT NULL, generated_at DATETIME NOT NULL,
+ PRIMARY KEY(user_id,insight_date), KEY idx_generated(generated_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+CREATE TABLE IF NOT EXISTS healtools_user_daily_activity (
+ user_id BIGINT UNSIGNED NOT NULL, activity_date DATE NOT NULL, first_active_at DATETIME NOT NULL,
+ last_active_at DATETIME NOT NULL, request_count INT UNSIGNED NOT NULL DEFAULT 1,
+ PRIMARY KEY(user_id,activity_date),KEY idx_activity_date(activity_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
