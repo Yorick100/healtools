@@ -26,8 +26,22 @@ async function requireUser(req,res,next) {
     next();
   } catch (e) { next(e); }
 }
+async function responseWithAdvice(userId, tool, out) {
+  if (!['sleep','diet','emotion'].includes(tool) || out.duplicate) return out;
+  try { return { ...out, advisor_insight:await advisor(userId) }; }
+  catch (err) { console.warn('[advisor] generation after save failed:',String(err.message||err).slice(0,180)); return { ...out, advisor_error:'建议生成暂时失败，可到记录页重试' }; }
+}
 function register(app) {
-  app.get('/system/ping', (req,res)=>{ const ready=ai.aiConfigured(); res.json({ok:true,server_time:new Date().toISOString(),service:'healtools-cloudrun',version:'0.4.6',ai_enabled:ready,ai_provider:ready?'cloudbase_http':'deterministic_v040',ai_model:process.env.CLOUDBASE_AI_MODEL||null}); });
+  app.get('/system/ping', (req,res)=>{ res.set('X-HEALTOOLS-Backend', '0.4.6.1'); const ready=ai.aiConfigured(); res.json({ok:true,server_time:new Date().toISOString(),service:'healtools-cloudrun',version:'0.4.6.1',ai_enabled:ready,ai_provider:ready?'cloudbase_http':'deterministic_v040',ai_model:process.env.CLOUDBASE_AI_MODEL||null}); });
+  // This is a database readiness check; /system/ping only checks the HTTP process.
+  app.get('/system/ready', async (req,res)=>{
+    let timer;
+    try { await Promise.race([db.one('SELECT 1 AS healthy'),new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('DB timeout')),3000);})]);
+      res.json({ok:true,backend_version:'0.4.6.1',database:'reachable'});
+    } catch (e) { console.error('[ready] database not reachable:',String(e.message||e).slice(0,180));
+      res.status(503).json({ok:false,backend_version:'0.4.6.1',database:'unavailable',request_id:req.requestId}); }
+    finally { if(timer)clearTimeout(timer); }
+  });
   app.get('/content/config', (req,res)=>res.json({
     config_version:7,
     min_app_version:'0.4.0',
@@ -104,9 +118,9 @@ function register(app) {
   });
 
   for (const tool of ['breathing','meditation']) app.post(`/${tool}/sessions`,requireUser,async(req,res,next)=>{try{res.json(await domain.submitRecord(req.htUser.id,tool,req.body||{}));}catch(e){next(e);}});
-  app.post('/diet/checkins',requireUser,async(req,res,next)=>{try{res.json(await domain.submitRecord(req.htUser.id,'diet',req.body||{}));}catch(e){next(e);}});
-  app.post('/emotion/assessments',requireUser,async(req,res,next)=>{try{res.json(await domain.submitRecord(req.htUser.id,'emotion',req.body||{}));}catch(e){next(e);}});
-  app.post('/sleep/diaries',requireUser,async(req,res,next)=>{try{res.json(await domain.submitRecord(req.htUser.id,'sleep',req.body||{}));}catch(e){next(e);}});
+  app.post('/diet/checkins',requireUser,async(req,res,next)=>{try{const out=await domain.submitRecord(req.htUser.id,'diet',req.body||{});res.json(await responseWithAdvice(req.htUser.id,'diet',out));}catch(e){next(e);}});
+  app.post('/emotion/assessments',requireUser,async(req,res,next)=>{try{const out=await domain.submitRecord(req.htUser.id,'emotion',req.body||{});res.json(await responseWithAdvice(req.htUser.id,'emotion',out));}catch(e){next(e);}});
+  app.post('/sleep/diaries',requireUser,async(req,res,next)=>{try{const out=await domain.submitRecord(req.htUser.id,'sleep',req.body||{});res.json(await responseWithAdvice(req.htUser.id,'sleep',out));}catch(e){next(e);}});
 
   app.get('/history',requireUser,async(req,res,next)=>{try{
     const from=String(req.query.from||DateTime.utc().minus({days:29}).toISODate()),to=String(req.query.to||DateTime.utc().toISODate()),uid=req.htUser.id;
@@ -120,12 +134,48 @@ function register(app) {
   app.get('/weekly-insight',requireUser,async(req,res,next)=>{try{const s=await domain.starSummary(req.htUser.id);res.json({week_start:DateTime.utc().startOf('week').toISODate(),insight:{code:'weekly_consistency',text:`本周已记录 ${s.week_star} 颗星。这只是行为记录，不代表医学健康水平。`,non_causal:true}});}catch(e){next(e);}});
 
   const resourceTool={breathing_session:'breathing',meditation_session:'meditation',diet_checkin:'diet',emotion_assessment:'emotion',sleep_diary:'sleep'};
-  app.post('/sync/batch',requireUser,async(req,res,next)=>{try{const rows=Array.isArray(req.body?.mutations)?req.body.mutations.slice(0,100):[],results=[];for(const m of rows){const tool=resourceTool[String(m.resource||'')];if(!tool){results.push({mutation_id:m.mutation_id,status:'ignored'});continue;}try{const p={...(m.payload||{}),record_id:m.record_id||m.mutation_id,health_date:m.health_date||(m.payload||{}).health_date,role:m.role||(m.payload||{}).role,card_no:m.card_no||(m.payload||{}).card_no};const r=await domain.submitRecord(req.htUser.id,tool,p);results.push({mutation_id:m.mutation_id,status:r.duplicate?'duplicate':'applied',server_version:r.server_version});}catch(e){results.push({mutation_id:m.mutation_id,status:'error',code:e.code||'service_error'});}}const cur=await db.one(`SELECT COALESCE(MAX(change_id),0) n FROM healtools_sync_changes WHERE user_id=?`,[req.htUser.id]);res.json({results,changes:[],next_cursor:Number(cur.n||0),summary:await domain.starSummary(req.htUser.id),server_time:new Date().toISOString()});}catch(e){next(e);}});
-  app.post('/guest/merge',requireUser,async(req,res,next)=>{try{const rows=Array.isArray(req.body?.records)?req.body.records.slice(0,100):[];let merged=0,skipped=0,star_delta=0;for(const m of rows){const tool=resourceTool[String(m.resource||'')];if(!tool){skipped++;continue;}try{const r=await domain.submitRecord(req.htUser.id,tool,{...(m.payload||{}),record_id:m.record_id||(m.payload||{}).record_id});if(r.duplicate)skipped++;else merged++;star_delta+=Number(r.star_delta||0);}catch(_){skipped++;}}res.json({merged_records:merged,skipped_records:skipped,star_delta,...(await domain.starSummary(req.htUser.id))});}catch(e){next(e);}});
+  app.post('/sync/batch',requireUser,async(req,res,next)=>{
+    try {
+      const mutations=Array.isArray(req.body?.mutations)?req.body.mutations.slice(0,100):[];
+      const results=[];
+      let advisorDirty=false;
+      for(const m of mutations){
+        const tool=resourceTool[String(m.resource||'')];
+        if(!tool){results.push({mutation_id:m.mutation_id,status:'ignored'});continue;}
+        try {
+          const p={...(m.payload||{}),record_id:m.record_id||m.mutation_id,
+            health_date:m.health_date||(m.payload||{}).health_date,role:m.role||(m.payload||{}).role,
+            card_no:m.card_no||(m.payload||{}).card_no};
+          const r=await domain.submitRecord(req.htUser.id,tool,p);
+          results.push({mutation_id:m.mutation_id,status:r.duplicate?'duplicate':'applied',server_version:r.server_version});
+          if(!r.duplicate && ['sleep','diet','emotion'].includes(tool))advisorDirty=true;
+        } catch (err) {
+          console.warn('[sync/batch] mutation failed',JSON.stringify({tool,code:err.code||'service_error',request_id:req.requestId}));
+          results.push({mutation_id:m.mutation_id,status:'error',code:err.code||'service_error'});
+        }
+      }
+      const cur=await db.one('SELECT COALESCE(MAX(change_id),0) n FROM healtools_sync_changes WHERE user_id=?',[req.htUser.id]);
+      const body={results,changes:[],next_cursor:Number(cur.n||0),summary:await domain.starSummary(req.htUser.id),server_time:new Date().toISOString()};
+      // One inference at most per successful batch, after the DB transaction commits.
+      // Never let a model outage lose a successfully synchronized health record.
+      if(advisorDirty){
+        try { body.advisor_insight=await advisor(req.htUser.id); }
+        catch(err) { body.advisor_error='建议暂不可用，请稍后进入记录重试'; console.warn('[advisor] batch failed:',String(err.message||err).slice(0,180)); }
+      }
+      res.json(body);
+    } catch(err){next(err);}
+  });
+  app.post('/guest/merge',requireUser,async(req,res,next)=>{try{const rows=Array.isArray(req.body?.records)?req.body.records.slice(0,100):[];let merged=0,skipped=0,star_delta=0;for(const m of rows){const tool=resourceTool[String(m.resource||'')];if(!tool){skipped++;continue;}try{const r=await domain.submitRecord(req.htUser.id,tool,{...(m.payload||{}),record_id:m.record_id||(m.payload||{}).record_id});if(r.duplicate)skipped++;else merged++;star_delta+=Number(r.star_delta||0);}catch(_){skipped++;}}const response={merged_records:merged,skipped_records:skipped,star_delta,...(await domain.starSummary(req.htUser.id))};
+    if(merged>0) { try { response.advisor_insight=await advisor(req.htUser.id); }catch(e){console.warn('[advisor] guest merge',e.message);} }
+    res.json(response);}catch(e){next(e);}});
 
   app.post('/data-export',requireUser,async(req,res,next)=>{try{const uid=req.htUser.id,u=req.htUser;const data={exported_at:new Date().toISOString(),user_id:u.user_uuid,profile:await domain.profile(uid),routine:await domain.routine(uid),daily_cards:await db.query(`SELECT * FROM healtools_daily_cards WHERE user_id=? ORDER BY health_date,card_no`,[uid]),records:await db.query(`SELECT * FROM healtools_task_records WHERE user_id=? AND deleted_at IS NULL ORDER BY health_date`,[uid]),stars:await db.query(`SELECT * FROM healtools_star_ledger WHERE user_id=? ORDER BY created_at`,[uid]),daily_insights:await db.query(`SELECT * FROM healtools_daily_insights WHERE user_id=? ORDER BY insight_date`,[uid])};const cb=cloudbaseApp();if(!cb)return res.json({storage:false,data});const file=Buffer.from(JSON.stringify(data,null,2),'utf8'),cloudPath=`healtools/private/exports/${u.user_uuid}/${domain.uuid()}.json`;const up=await cb.uploadFile({cloudPath,fileContent:file});let url='';try{const x=await cb.getTempFileURL({fileList:[up.fileID]});url=x?.fileList?.[0]?.tempFileURL||'';}catch(_){}res.json({storage:true,file_id:up.fileID,download_url:url,expires_notice:'临时链接会过期，请及时下载。'});}catch(e){next(e);}});
   app.delete('/me/data',requireUser,async(req,res,next)=>{try{if(String(req.body?.confirm||'')!=='DELETE')return fail(res,400,'confirmation_required','请提交 confirm=DELETE 以确认删除。');const uid=req.htUser.id;await db.tx(async conn=>{for(const t of ['healtools_consent_records','healtools_daily_cards','healtools_task_records','healtools_star_ledger','healtools_sync_changes','healtools_usage_events','healtools_daily_insights','healtools_advisor_insights','healtools_user_daily_activity','healtools_user_profiles','healtools_user_routines','healtools_wechat_identities'])await conn.execute(`DELETE FROM ${t} WHERE user_id=?`,[uid]);await conn.execute(`DELETE FROM healtools_users WHERE id=?`,[uid]);});res.json({deleted:true,server_time:new Date().toISOString()});}catch(e){next(e);}});
 
+  app.get('/admin/diagnostics',basicAuth,async(req,res)=>{
+    try { await db.one('SELECT 1 AS ok');res.json({ok:true,backend:'0.4.6.1',database:'reachable'}); }
+    catch(err){console.error('[admin/diagnostics]',err.message);res.status(503).json({ok:false,backend:'0.4.6.1',database:'unavailable',request_id:req.requestId});}
+  });
   app.get('/admin',basicAuth,dashboard);
 }
 module.exports = { register, requireUser, fail };

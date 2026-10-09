@@ -1,41 +1,103 @@
-const crypto=require('crypto');
-const db=require('./db');
-const {healthDate}=require('./domain');
-const {generateLifestyleInsight}=require('./ai');
-function payload(x){try{return typeof x==='string'?JSON.parse(x):x||{};}catch(_){return {};}}
-const TYPES=['sleep','diet','emotion'];
-function fallback(type,p){
- if(type==='sleep')return Number(p.quality||0)<=2?'最近一次睡眠感受偏低，可以尝试固定起床时间，睡前留出一段安静的放松时间。':'继续保持适合自己的作息节奏，关注睡醒后的主观感受。';
- if(type==='diet')return p.answers?.regularity==='有'?'可以尝试提前安排下一餐，避免长时间空腹；无需严格计算食物热量。':'尝试保持规律用餐，并按自己的条件兼顾主食、蛋白质和蔬菜。';
- return Number(p.answers?.stress||0)>=4?'你记录的压力较高，可以尝试短暂离开当前任务，做一次舒适慢呼吸。':'留意今天的精力与压力变化，给自己留一点可执行的休息时间。';
+'use strict';
+const crypto = require('crypto');
+const db = require('./db');
+const { healthDate } = require('./domain');
+const { generateLifestyleInsight } = require('./ai');
+
+const TYPES = ['sleep', 'diet', 'emotion'];
+const NAMES = { sleep: '睡眠日记', diet: '饮食计划', emotion: '情绪自评' };
+function payload(v) { try { return typeof v === 'string' ? JSON.parse(v) : (v || {}); } catch (_) { return {}; } }
+function adviceFallback(type, p) {
+  if (type === 'sleep') return Number(p.quality || 0) <= 2 ? '你最近一次睡眠感受偏低，可以尝试固定起床时间，并在睡前预留安静放松时间。' : '可以继续保持目前适合自己的作息，并留意醒来后的精神状态。';
+  if (type === 'diet') return p.answers?.regularity === '有' ? '上次提到曾长时间没有进食，可以提前准备一份简便加餐，让进食安排更从容。' : '可以尝试规律进食，并按照现有条件搭配主食、蛋白质和蔬菜。';
+  return Number(p.answers?.stress || 0) >= 4 ? '上次记录的压力较高，可以短暂离开当前任务，做一小段舒适慢呼吸。' : '留意精力和压力变化，给自己留一段可实现的休息时间。';
 }
-async function advisor(userId){
- const h=await healthDate(userId), today=h.health_date;
- const rows=await db.query(`SELECT record_uuid,tool_type,health_date,payload_json,COALESCE(completed_at,client_updated_at,client_created_at,started_at) entered_at FROM healtools_task_records WHERE user_id=? AND tool_type IN ('sleep','diet','emotion') AND deleted_at IS NULL AND status IN ('completed','partial','late_record') ORDER BY COALESCE(completed_at,client_updated_at,client_created_at,started_at) DESC,id DESC LIMIT 150`,[userId]);
- const latest={};for(const r of rows){if(!latest[r.tool_type])latest[r.tool_type]=r;}
- const sources=TYPES.filter(x=>latest[x]);const result={title:'AI健康顾问 · 个人生活建议',health_date:today,available:sources.length>0,items:[],based_on_date:'',note:'建议仅基于你输入的日常记录，不是疾病诊断或治疗方案。'};
- if(!sources.length)return {...result,provider:'no_data',cached:true};
- const fingerprint=sources.map(x=>`${x}:${latest[x].record_uuid}`).join('|');
- const hash=crypto.createHash('sha256').update(fingerprint).digest('hex');
- const cached=await db.one('SELECT source_hash,provider,content_json,generated_at FROM healtools_advisor_insights WHERE user_id=? AND insight_date=?',[userId,today]);
- if(cached?.source_hash===hash && cached.provider!=='generating')return {...payload(cached.content_json),provider:cached.provider,cached:true,generated_at:cached.generated_at};
- // Claim generation through an atomic unique-day row. A newly changed hash invalidates the previous result.
- let owns=false;
- if(!cached){
-  const x=await db.query(`INSERT IGNORE INTO healtools_advisor_insights(user_id,insight_date,source_hash,provider,content_json,generated_at) VALUES(?,?,?,'generating','{}',UTC_TIMESTAMP())`,[userId,today,hash]);owns=Number(x.affectedRows)>0;
- }else{
-  const x=await db.query(`UPDATE healtools_advisor_insights SET source_hash=?,provider='generating',content_json='{}',generated_at=UTC_TIMESTAMP() WHERE user_id=? AND insight_date=? AND source_hash=? AND (provider<>'generating' OR generated_at<UTC_TIMESTAMP()-INTERVAL 30 SECOND)`,[hash,userId,today,cached.source_hash]);owns=Number(x.affectedRows)>0;
- }
- if(!owns){for(let i=0;i<15;i++){await new Promise(r=>setTimeout(r,300));const row=await db.one('SELECT source_hash,provider,content_json,generated_at FROM healtools_advisor_insights WHERE user_id=? AND insight_date=?',[userId,today]);if(row?.source_hash===hash && row.provider!=='generating')return {...payload(row.content_json),provider:row.provider,cached:true,generated_at:row.generated_at};}return {...result,provider:'generating',pending:true};}
- try{
-  const ctx={based_on_date:today};
-  const info={sleep:'睡眠日记',diet:'饮食计划',emotion:'情绪自评'};
-  result.items=sources.map(type=>{const r=latest[type],p=payload(r.payload_json);ctx[type]={available:true,...(type==='sleep'?{quality:p.quality,latency_min:p.sleep_latency_min,awakenings:p.awakenings,bedtime_text:p.bedtime_text,wake_time_text:p.wake_time_text}:type==='diet'?{meal_time_text:p.meal_time_text,regularity:p.answers?.regularity,plate:p.answers?.plate,night:p.answers?.night}:{energy:p.answers?.energy,stress:p.answers?.stress})};return {type,title:info[type],summary:`基于最近一次${info[type]}输入`,source_date:String(r.health_date).slice(0,10),text:fallback(type,p)};});
-  let provider='deterministic_v046';
-  try{const ai=await generateLifestyleInsight(ctx);if(ai){for(const item of result.items)if(ai[item.type])item.text=ai[item.type];if(ai.overall)result.overall=ai.overall;provider='cloudbase_ai';}}catch(e){console.warn('[advisor]',e.message);}
-  const latestHash=(await db.one('SELECT source_hash FROM healtools_advisor_insights WHERE user_id=? AND insight_date=?',[userId,today]))?.source_hash;
-  if(latestHash===hash)await db.query(`UPDATE healtools_advisor_insights SET provider=?,content_json=?,generated_at=UTC_TIMESTAMP() WHERE user_id=? AND insight_date=? AND source_hash=?`,[provider,JSON.stringify(result),userId,today,hash]);
-  return {...result,provider,cached:false};
- }catch(e){await db.query(`UPDATE healtools_advisor_insights SET provider='error' WHERE user_id=? AND insight_date=? AND source_hash=?`,[userId,today,hash]).catch(()=>{});throw e;}
+function emptyResult(date) {
+  return { title: '健康顾问 · 个人生活建议', health_date: date, available: false, items: [], based_on_date: '', note: '仅用于日常生活方式参考，不提供医疗诊断或治疗建议。' };
 }
-module.exports={advisor};
+async function latestRecords(userId) {
+  // Independently fetch the latest entry for each tool. A global LIMIT can hide
+  // a user's older (but most recent) sleep entry behind many diet check-ins.
+  const rows = await Promise.all(TYPES.map(async type => {
+    const row = await db.one(`SELECT record_uuid,tool_type,DATE_FORMAT(health_date,'%Y-%m-%d') health_date,payload_json,
+      COALESCE(completed_at,client_updated_at,client_created_at,started_at) entered_at
+      FROM healtools_task_records WHERE user_id=? AND tool_type=? AND deleted_at IS NULL
+      AND status IN ('completed','partial','late_record')
+      ORDER BY COALESCE(completed_at,client_updated_at,client_created_at,started_at) DESC,id DESC LIMIT 1`, [userId, type]);
+    return row || null;
+  }));
+  return rows.filter(Boolean);
+}
+function fingerprint(rows) {
+  // Hash actual data as well as UUID, so edits with the same UUID also invalidate.
+  const src = rows.map(r => `${r.tool_type}:${r.record_uuid}:${r.payload_json || ''}`).join('|');
+  return crypto.createHash('sha256').update(src).digest('hex');
+}
+async function awaitClaim(userId, today, hash, empty) {
+  // Concurrent callers await the winning writer, without launching another AI request.
+  for (let i = 0; i < 30; i++) {
+    await new Promise(resolve => setTimeout(resolve, 350));
+    const row = await db.one('SELECT source_hash,provider,content_json,generated_at FROM healtools_advisor_insights WHERE user_id=? AND insight_date=?',[userId,today]);
+    if (row?.source_hash === hash && row.provider !== 'generating' && row.provider !== 'error') {
+      return { ...payload(row.content_json), provider: row.provider, cached: true, generated_at: row.generated_at };
+    }
+    if (row && row.source_hash !== hash) return { ...empty, provider: 'generating', pending: true };
+  }
+  return { ...empty, provider: 'generating', pending: true };
+}
+async function advisor(userId) {
+  const today = (await healthDate(userId)).health_date;
+  const rows = await latestRecords(userId);
+  const empty = emptyResult(today);
+  if (!rows.length) return { ...empty, provider: 'no_data', cached: true };
+  const hash = fingerprint(rows);
+  const cached = await db.one('SELECT source_hash,provider,content_json,generated_at FROM healtools_advisor_insights WHERE user_id=? AND insight_date=?',[userId,today]);
+  if (cached?.source_hash === hash && cached.provider !== 'generating' && cached.provider !== 'error') {
+    return { ...payload(cached.content_json), provider: cached.provider, cached: true, generated_at: cached.generated_at };
+  }
+  let claimed = false;
+  if (!cached) {
+    const q = await db.query(`INSERT IGNORE INTO healtools_advisor_insights (user_id,insight_date,source_hash,provider,content_json,generated_at) VALUES (?,?,?,'generating','{}',UTC_TIMESTAMP())`,[userId,today,hash]);
+    claimed = Number(q.affectedRows) > 0;
+  } else {
+    const q = await db.query(`UPDATE healtools_advisor_insights SET source_hash=?,provider='generating',content_json='{}',generated_at=UTC_TIMESTAMP()
+      WHERE user_id=? AND insight_date=? AND source_hash=? AND (provider<>'generating' OR generated_at<UTC_TIMESTAMP()-INTERVAL 30 SECOND)`,[hash,userId,today,cached.source_hash]);
+    claimed = Number(q.affectedRows) > 0;
+  }
+  if (!claimed) return awaitClaim(userId,today,hash,empty);
+
+  try {
+    const result = { ...empty, available: true, based_on_date: rows[0].health_date };
+    const context = { based_on_date: today };
+    result.items = rows.map(row => {
+      const type = row.tool_type, p = payload(row.payload_json);
+      context[type] = { available:true, ...(type === 'sleep' ? {
+        quality:p.quality, latency_min:p.sleep_latency_min, awakenings:p.awakenings,
+        bedtime_text:p.bedtime_text, wake_time_text:p.wake_time_text
+      } : type === 'diet' ? {
+        meal_time_text:p.meal_time_text, regularity:p.answers?.regularity,plate:p.answers?.plate,night:p.answers?.night
+      } : { energy:p.answers?.energy, stress:p.answers?.stress }) };
+      return { type, title:NAMES[type], summary:`根据最近一次${NAMES[type]}输入`, source_date:row.health_date, text:adviceFallback(type,p) };
+    });
+    // Every AI call has a bounded timeout in src/ai.js; fallback is clearly labelled.
+    let provider = 'deterministic_v046';
+    try {
+      const generated = await generateLifestyleInsight(context);
+      if (generated) {
+        for (const item of result.items) if (generated[item.type]) item.text = generated[item.type];
+        if (generated.overall) result.overall = generated.overall;
+        provider = 'cloudbase_ai';
+      }
+    } catch (err) { console.warn('[advisor] AI fallback:', String(err.message || err).slice(0,160)); }
+    // Compare-and-set avoids an older inference overwriting a newer edit.
+    const q = await db.query(`UPDATE healtools_advisor_insights SET provider=?,content_json=?,generated_at=UTC_TIMESTAMP()
+      WHERE user_id=? AND insight_date=? AND source_hash=? AND provider='generating'`,[provider,JSON.stringify(result),userId,today,hash]);
+    if (!q.affectedRows) return { ...result, provider, cached:false, stale:true };
+    console.info('[advisor] completed', JSON.stringify({ provider, count:result.items.length, date:today }));
+    return { ...result, provider, cached:false };
+  } catch (err) {
+    await db.query(`UPDATE healtools_advisor_insights SET provider='error' WHERE user_id=? AND insight_date=? AND source_hash=?`,[userId,today,hash]).catch(()=>{});
+    throw err;
+  }
+}
+module.exports = { advisor, fingerprint, latestRecords };
