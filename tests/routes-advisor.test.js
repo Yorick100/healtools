@@ -11,7 +11,7 @@ function makeApp({failAdvisor=false}={}) {
  const mocks={
   luxon:{DateTime:{now:()=>({setZone:()=>({isValid:true})})}},
   './db':{query:async()=>({affectedRows:1}),one:async()=>({n:1})},
-  './domain':{ensureUser:async()=>({id:3}),healthDate:async()=>({health_date:'2026-10-09'}),submitRecord:async(_id,_type,p)=>{saves++;return {server_version:1,duplicate:p.record_id==='already',star_delta:0};},starSummary:async()=>({total_star:0})},
+  './domain':{ensureUser:async()=>({id:3}),healthDate:async()=>({health_date:'2026-10-09'}),submitRecord:async(_id,_type,p)=>{saves++;return {record_id:p.record_id,server_version:1,duplicate:p.record_id==='already',star_delta:0};},starSummary:async()=>({total_star:0})},
   './ai':{aiConfigured:()=>true},
   './cloudbase':{cloudbaseApp:()=>{}},
   './admin':{basicAuth:(_req,_res,next)=>next(),dashboard:()=>{}},
@@ -42,4 +42,26 @@ test('duplicate and non-wellness sync does not call model',async()=>{
 test('model failure does not lose committed sync records',async()=>{
  const a=makeApp({failAdvisor:true});const resp=await invoke(a,[{resource:'emotion_assessment',mutation_id:'m2',record_id:'m2',payload:{}}]);
  assert.equal(a.adviceCalls,1);assert.equal(resp.results[0].status,'applied');assert.ok(resp.advisor_error);
+});
+
+async function invokeDirect(route, path, recordId){
+ const req={headers:{'x-wx-openid':'test-openid'},body:{record_id:recordId,health_date:'2026-10-10',quality:3,bedtime_text:'23:30',wake_time_text:'07:30'},requestId:'direct-test'};
+ let result;
+ const res={json(x){result=x;return this;},status(){return this;}};
+ const stack=route.handlers['POST '+path];assert.equal(stack.length,2);
+ await new Promise((resolve,reject)=>stack[0](req,res,e=>e?reject(e):resolve()));
+ await stack[1](req,res,e=>{if(e)throw e;});
+ return result;
+}
+test('direct sleep diary returns the same UUID and triggers adviser only after save',async()=>{
+ const a=makeApp(),id='12345678-1234-4123-8123-123456789abc';
+ const out=await invokeDirect(a,'/sleep/diaries',id);
+ assert.equal(out.record_id,id);
+ assert.equal(a.saves,1);assert.equal(a.adviceCalls,1);
+ assert.equal(out.advisor_insight.provider,'cloudbase_ai');
+});
+test('direct breathing session returns UUID without adviser inference',async()=>{
+ const a=makeApp(),id='12345678-1234-4123-8123-123456789abd';
+ const out=await invokeDirect(a,'/breathing/sessions',id);
+ assert.equal(out.record_id,id);assert.equal(a.saves,1);assert.equal(a.adviceCalls,0);
 });

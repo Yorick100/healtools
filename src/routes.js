@@ -32,14 +32,14 @@ async function responseWithAdvice(userId, tool, out) {
   catch (err) { console.warn('[advisor] generation after save failed:',String(err.message||err).slice(0,180)); return { ...out, advisor_error:'建议生成暂时失败，可到记录页重试' }; }
 }
 function register(app) {
-  app.get('/system/ping', (req,res)=>{ res.set('X-HEALTOOLS-Backend', '0.4.6.1'); const ready=ai.aiConfigured(); res.json({ok:true,server_time:new Date().toISOString(),service:'healtools-cloudrun',version:'0.4.6.1',ai_enabled:ready,ai_provider:ready?'cloudbase_http':'deterministic_v040',ai_model:process.env.CLOUDBASE_AI_MODEL||null}); });
+  app.get('/system/ping', (req,res)=>{ res.set('X-HEALTOOLS-Backend', '0.4.6.2'); const ready=ai.aiConfigured(); res.json({ok:true,server_time:new Date().toISOString(),service:'healtools-cloudrun',version:'0.4.6.2',ai_enabled:ready,ai_provider:ready?'cloudbase_http':'deterministic_v040',ai_model:process.env.CLOUDBASE_AI_MODEL||null}); });
   // This is a database readiness check; /system/ping only checks the HTTP process.
   app.get('/system/ready', async (req,res)=>{
     let timer;
     try { await Promise.race([db.one('SELECT 1 AS healthy'),new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('DB timeout')),3000);})]);
-      res.json({ok:true,backend_version:'0.4.6.1',database:'reachable'});
+      res.json({ok:true,backend_version:'0.4.6.2',database:'reachable'});
     } catch (e) { console.error('[ready] database not reachable:',String(e.message||e).slice(0,180));
-      res.status(503).json({ok:false,backend_version:'0.4.6.1',database:'unavailable',request_id:req.requestId}); }
+      res.status(503).json({ok:false,backend_version:'0.4.6.2',database:'unavailable',request_id:req.requestId}); }
     finally { if(timer)clearTimeout(timer); }
   });
   app.get('/content/config', (req,res)=>res.json({
@@ -117,10 +117,10 @@ function register(app) {
     }catch(e){next(e);}
   });
 
-  for (const tool of ['breathing','meditation']) app.post(`/${tool}/sessions`,requireUser,async(req,res,next)=>{try{res.json(await domain.submitRecord(req.htUser.id,tool,req.body||{}));}catch(e){next(e);}});
-  app.post('/diet/checkins',requireUser,async(req,res,next)=>{try{const out=await domain.submitRecord(req.htUser.id,'diet',req.body||{});res.json(await responseWithAdvice(req.htUser.id,'diet',out));}catch(e){next(e);}});
-  app.post('/emotion/assessments',requireUser,async(req,res,next)=>{try{const out=await domain.submitRecord(req.htUser.id,'emotion',req.body||{});res.json(await responseWithAdvice(req.htUser.id,'emotion',out));}catch(e){next(e);}});
-  app.post('/sleep/diaries',requireUser,async(req,res,next)=>{try{const out=await domain.submitRecord(req.htUser.id,'sleep',req.body||{});res.json(await responseWithAdvice(req.htUser.id,'sleep',out));}catch(e){next(e);}});
+  for (const tool of ['breathing','meditation']) app.post(`/${tool}/sessions`,requireUser,async(req,res,next)=>{try{const out=await domain.submitRecord(req.htUser.id,tool,req.body||{});console.info('[record] saved',JSON.stringify({tool,duplicate:!!out.duplicate,request_id:req.requestId}));res.json(out);}catch(e){next(e);}});
+  app.post('/diet/checkins',requireUser,async(req,res,next)=>{try{const out=await domain.submitRecord(req.htUser.id,'diet',req.body||{});console.info('[record] saved',JSON.stringify({tool:'diet',duplicate:!!out.duplicate,request_id:req.requestId}));res.json(await responseWithAdvice(req.htUser.id,'diet',out));}catch(e){next(e);}});
+  app.post('/emotion/assessments',requireUser,async(req,res,next)=>{try{const out=await domain.submitRecord(req.htUser.id,'emotion',req.body||{});console.info('[record] saved',JSON.stringify({tool:'emotion',duplicate:!!out.duplicate,request_id:req.requestId}));res.json(await responseWithAdvice(req.htUser.id,'emotion',out));}catch(e){next(e);}});
+  app.post('/sleep/diaries',requireUser,async(req,res,next)=>{try{const out=await domain.submitRecord(req.htUser.id,'sleep',req.body||{});console.info('[record] saved',JSON.stringify({tool:'sleep',duplicate:!!out.duplicate,request_id:req.requestId}));res.json(await responseWithAdvice(req.htUser.id,'sleep',out));}catch(e){next(e);}});
 
   app.get('/history',requireUser,async(req,res,next)=>{try{
     const from=String(req.query.from||DateTime.utc().minus({days:29}).toISODate()),to=String(req.query.to||DateTime.utc().toISODate()),uid=req.htUser.id;
@@ -154,6 +154,7 @@ function register(app) {
           results.push({mutation_id:m.mutation_id,status:'error',code:err.code||'service_error'});
         }
       }
+      if(mutations.length)console.info('[sync/batch] result',JSON.stringify({submitted:mutations.length,applied:results.filter(r=>r.status==='applied').length,duplicate:results.filter(r=>r.status==='duplicate').length,errors:results.filter(r=>r.status==='error').length,ignored:results.filter(r=>r.status==='ignored').length,request_id:req.requestId}));
       const cur=await db.one('SELECT COALESCE(MAX(change_id),0) n FROM healtools_sync_changes WHERE user_id=?',[req.htUser.id]);
       const body={results,changes:[],next_cursor:Number(cur.n||0),summary:await domain.starSummary(req.htUser.id),server_time:new Date().toISOString()};
       // One inference at most per successful batch, after the DB transaction commits.
@@ -173,8 +174,8 @@ function register(app) {
   app.delete('/me/data',requireUser,async(req,res,next)=>{try{if(String(req.body?.confirm||'')!=='DELETE')return fail(res,400,'confirmation_required','请提交 confirm=DELETE 以确认删除。');const uid=req.htUser.id;await db.tx(async conn=>{for(const t of ['healtools_consent_records','healtools_daily_cards','healtools_task_records','healtools_star_ledger','healtools_sync_changes','healtools_usage_events','healtools_daily_insights','healtools_advisor_insights','healtools_user_daily_activity','healtools_user_profiles','healtools_user_routines','healtools_wechat_identities'])await conn.execute(`DELETE FROM ${t} WHERE user_id=?`,[uid]);await conn.execute(`DELETE FROM healtools_users WHERE id=?`,[uid]);});res.json({deleted:true,server_time:new Date().toISOString()});}catch(e){next(e);}});
 
   app.get('/admin/diagnostics',basicAuth,async(req,res)=>{
-    try { await db.one('SELECT 1 AS ok');res.json({ok:true,backend:'0.4.6.1',database:'reachable'}); }
-    catch(err){console.error('[admin/diagnostics]',err.message);res.status(503).json({ok:false,backend:'0.4.6.1',database:'unavailable',request_id:req.requestId});}
+    try { await db.one('SELECT 1 AS ok');res.json({ok:true,backend:'0.4.6.2',database:'reachable'}); }
+    catch(err){console.error('[admin/diagnostics]',err.message);res.status(503).json({ok:false,backend:'0.4.6.2',database:'unavailable',request_id:req.requestId});}
   });
   app.get('/admin',basicAuth,dashboard);
 }
