@@ -5,6 +5,7 @@ const ai = require('./ai');
 const { cloudbaseApp } = require('./cloudbase');
 const { basicAuth, dashboard } = require('./admin');
 const {advisor}=require('./advisor');
+const { checkText } = require('./ugc');
 
 function fail(res, status, code, message, extra={}) { return res.status(status).json({ code, message, data:{ retryable:status>=500 || status===429, ...extra } }); }
 function identity(req) {
@@ -32,14 +33,14 @@ async function responseWithAdvice(userId, tool, out) {
   catch (err) { console.warn('[advisor] generation after save failed:',String(err.message||err).slice(0,180)); return { ...out, advisor_error:'建议生成暂时失败，可到记录页重试' }; }
 }
 function register(app) {
-  app.get('/system/ping', (req,res)=>{ res.set('X-HEALTOOLS-Backend', '0.5.1'); const ready=ai.aiConfigured(); res.json({ok:true,server_time:new Date().toISOString(),service:'healtools-cloudrun',version:'0.5.1',ai_enabled:ready,ai_provider:ready?'cloudbase_http':'deterministic_v040',ai_model:process.env.CLOUDBASE_AI_MODEL||null}); });
+  app.get('/system/ping', (req,res)=>{ res.set('X-HEALTOOLS-Backend', '0.5.3-ugc1'); const ready=ai.aiConfigured(); res.json({ok:true,server_time:new Date().toISOString(),service:'healtools-cloudrun',version:'0.5.3-ugc1',ai_enabled:ready,ai_provider:ready?'cloudbase_http':'deterministic_v040',ai_model:process.env.CLOUDBASE_AI_MODEL||null}); });
   // This is a database readiness check; /system/ping only checks the HTTP process.
   app.get('/system/ready', async (req,res)=>{
     let timer;
     try { await Promise.race([db.one('SELECT 1 AS healthy'),new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('DB timeout')),3000);})]);
-      res.json({ok:true,backend_version:'0.5.1',database:'reachable'});
+      res.json({ok:true,backend_version:'0.5.3-ugc1',database:'reachable'});
     } catch (e) { console.error('[ready] database not reachable:',String(e.message||e).slice(0,180));
-      res.status(503).json({ok:false,backend_version:'0.5.1',database:'unavailable',request_id:req.requestId}); }
+      res.status(503).json({ok:false,backend_version:'0.5.3-ugc1',database:'unavailable',request_id:req.requestId}); }
     finally { if(timer)clearTimeout(timer); }
   });
   app.get('/content/config', (req,res)=>res.json({
@@ -60,20 +61,24 @@ function register(app) {
   app.post('/auth/wechat/bind', requireUser, (req,res)=>res.json({ok:true,wechat_bound:true}));
 
   app.get('/me', requireUser, async (req,res,next)=>{ try { const u=req.htUser,p=await domain.profile(u.id),r=await domain.routine(u.id);res.json({user_id:u.user_uuid,profile:p,account:{email:null,wechat_bound:true},routine:r,server_time:new Date().toISOString()}); }catch(e){next(e);} });
-  app.put('/me/profile', requireUser, async (req,res,next)=>{ try { const nickname=String(req.body?.nickname||'').trim(); if(!nickname || [...nickname].length>20)return fail(res,400,'validation_error','昵称需为 1–20 个字符'); await db.query(`INSERT INTO healtools_user_profiles(user_id,nickname,server_version,updated_at) VALUES(?,?,1,UTC_TIMESTAMP()) ON DUPLICATE KEY UPDATE nickname=VALUES(nickname),server_version=server_version+1,updated_at=UTC_TIMESTAMP()`,[req.htUser.id,nickname]); res.json({profile:await domain.profile(req.htUser.id)}); }catch(e){next(e);} });
+  app.put('/me/profile', requireUser, async (req,res,next)=>{ try { const nickname=String(req.body?.nickname||'').trim(); if(!nickname || [...nickname].length>20)return fail(res,400,'validation_error','昵称需为 1–20 个字符'); await checkText({content:nickname,openid:identity(req).openid,scene:1}); await db.query(`INSERT INTO healtools_user_profiles(user_id,nickname,server_version,updated_at) VALUES(?,?,1,UTC_TIMESTAMP()) ON DUPLICATE KEY UPDATE nickname=VALUES(nickname),server_version=server_version+1,updated_at=UTC_TIMESTAMP()`,[req.htUser.id,nickname]); res.json({profile:await domain.profile(req.htUser.id)}); }catch(e){next(e);} });
   app.put('/me/routine', requireUser, async (req,res,next)=>{ try { const wake=String(req.body?.usual_wake_time||'07:30').slice(0,5),sleep=String(req.body?.usual_sleep_time||'23:30').slice(0,5),tz=String(req.body?.timezone||'Asia/Shanghai'); if(!DateTime.now().setZone(tz).isValid)return fail(res,400,'validation_error','timezone 必须为有效 IANA 时区'); await db.query(`INSERT INTO healtools_user_routines(user_id,usual_wake_time,usual_sleep_time,timezone,server_version,updated_at) VALUES(?,?,?,?,1,UTC_TIMESTAMP()) ON DUPLICATE KEY UPDATE usual_wake_time=VALUES(usual_wake_time),usual_sleep_time=VALUES(usual_sleep_time),timezone=VALUES(timezone),server_version=server_version+1,updated_at=UTC_TIMESTAMP()`,[req.htUser.id,wake,sleep,tz]); res.json({routine:await domain.routine(req.htUser.id),effective_from:'immediate'}); }catch(e){next(e);} });
 
   app.get('/today', requireUser, async (req,res,next)=>{ try { const u=req.htUser,h=await domain.healthDate(u.id),rows=await domain.ensurePlan(u.id),sum=await domain.starSummary(u.id),history=await domain.recentHealthContext(u.id);res.json({server_time:new Date().toISOString(),health_date:h.health_date,timezone:h.timezone,plan_id:rows[0]?.plan_id||'',...sum,morning_review:{needed:!history.sleep?.available,sleep_date:history.yesterday},cards:domain.apiCards(rows),config_version:7}); }catch(e){next(e);} });
   app.post('/ai/recommend', requireUser, async (req,res,next)=>{
     try {
       const u=req.htUser;
-      const text=String(req.body?.text||'').trim().slice(0,200);
+      const rawText=String(req.body?.text||'').trim();
+      if ([...rawText].length>200) return fail(res,400,'ugc_input_invalid','状态描述最多 200 个字符');
+      const text=rawText;
       const quick=Array.isArray(req.body?.quick_intents)?req.body.quick_intents.slice(0,6):[];
       const replan=!!req.body?.replan;
       if(ai.hitsSafetyBoundary(text)){
         await domain.usageEvent(u.id,'ai_safety_boundary',{health_date:(await domain.healthDate(u.id)).health_date});
         return fail(res,422,'ai_safety_boundary','这类情况不适合用日常行动卡处理；如存在紧急或严重不适，请尽快寻求专业医疗帮助。');
       }
+      // 用户自由输入的内容必须先经过微信审核，才能进入 AI 或计划持久化流程。
+      await checkText({content:text,openid:identity(req).openid,scene:2});
       const h=await domain.healthDate(u.id);
       const existing=await domain.currentCards(u.id,h.health_date);
       // 客户端已完成而云端未同步时，不能再覆盖这些旧 card_no。
@@ -215,8 +220,8 @@ function register(app) {
   app.delete('/me/data',requireUser,async(req,res,next)=>{try{if(String(req.body?.confirm||'')!=='DELETE')return fail(res,400,'confirmation_required','请提交 confirm=DELETE 以确认删除。');const uid=req.htUser.id;await db.tx(async conn=>{for(const t of ['healtools_consent_records','healtools_daily_cards','healtools_task_records','healtools_star_ledger','healtools_sync_changes','healtools_usage_events','healtools_daily_insights','healtools_advisor_insights','healtools_user_daily_activity','healtools_user_profiles','healtools_user_routines','healtools_wechat_identities'])await conn.execute(`DELETE FROM ${t} WHERE user_id=?`,[uid]);await conn.execute(`DELETE FROM healtools_users WHERE id=?`,[uid]);});res.json({deleted:true,server_time:new Date().toISOString()});}catch(e){next(e);}});
 
   app.get('/admin/diagnostics',basicAuth,async(req,res)=>{
-    try { await db.one('SELECT 1 AS ok');res.json({ok:true,backend:'0.5.1',database:'reachable'}); }
-    catch(err){console.error('[admin/diagnostics]',err.message);res.status(503).json({ok:false,backend:'0.5.1',database:'unavailable',request_id:req.requestId});}
+    try { await db.one('SELECT 1 AS ok');res.json({ok:true,backend:'0.5.3-ugc1',database:'reachable'}); }
+    catch(err){console.error('[admin/diagnostics]',err.message);res.status(503).json({ok:false,backend:'0.5.3-ugc1',database:'unavailable',request_id:req.requestId});}
   });
   app.get('/admin',basicAuth,dashboard);
 }

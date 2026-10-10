@@ -15,6 +15,7 @@ function makeApp({failAdvisor=false}={}) {
   './ai':{aiConfigured:()=>true},
   './cloudbase':{cloudbaseApp:()=>{}},
   './admin':{basicAuth:(_req,_res,next)=>next(),dashboard:()=>{}},
+  './ugc':{checkText:async()=>({checked:true,outcome:'pass'})},
   './advisor':{advisor:async()=>{adviceCalls++;if(failAdvisor)throw new Error('mock model outage');return {available:true,items:[{type:'sleep',text:'test'}],provider:'cloudbase_ai'};}}
  };
  const mod={exports:{}};
