@@ -32,14 +32,14 @@ async function responseWithAdvice(userId, tool, out) {
   catch (err) { console.warn('[advisor] generation after save failed:',String(err.message||err).slice(0,180)); return { ...out, advisor_error:'建议生成暂时失败，可到记录页重试' }; }
 }
 function register(app) {
-  app.get('/system/ping', (req,res)=>{ res.set('X-HEALTOOLS-Backend', '0.5.0'); const ready=ai.aiConfigured(); res.json({ok:true,server_time:new Date().toISOString(),service:'healtools-cloudrun',version:'0.5.0',ai_enabled:ready,ai_provider:ready?'cloudbase_http':'deterministic_v040',ai_model:process.env.CLOUDBASE_AI_MODEL||null}); });
+  app.get('/system/ping', (req,res)=>{ res.set('X-HEALTOOLS-Backend', '0.5.1'); const ready=ai.aiConfigured(); res.json({ok:true,server_time:new Date().toISOString(),service:'healtools-cloudrun',version:'0.5.1',ai_enabled:ready,ai_provider:ready?'cloudbase_http':'deterministic_v040',ai_model:process.env.CLOUDBASE_AI_MODEL||null}); });
   // This is a database readiness check; /system/ping only checks the HTTP process.
   app.get('/system/ready', async (req,res)=>{
     let timer;
     try { await Promise.race([db.one('SELECT 1 AS healthy'),new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('DB timeout')),3000);})]);
-      res.json({ok:true,backend_version:'0.5.0',database:'reachable'});
+      res.json({ok:true,backend_version:'0.5.1',database:'reachable'});
     } catch (e) { console.error('[ready] database not reachable:',String(e.message||e).slice(0,180));
-      res.status(503).json({ok:false,backend_version:'0.5.0',database:'unavailable',request_id:req.requestId}); }
+      res.status(503).json({ok:false,backend_version:'0.5.1',database:'unavailable',request_id:req.requestId}); }
     finally { if(timer)clearTimeout(timer); }
   });
   app.get('/content/config', (req,res)=>res.json({
@@ -117,10 +117,25 @@ function register(app) {
     }catch(e){next(e);}
   });
 
-  for (const tool of ['breathing','meditation']) app.post(`/${tool}/sessions`,requireUser,async(req,res,next)=>{try{const out=await domain.submitRecord(req.htUser.id,tool,req.body||{});console.info('[record] saved',JSON.stringify({tool,duplicate:!!out.duplicate,request_id:req.requestId}));res.json(out);}catch(e){next(e);}});
-  app.post('/diet/checkins',requireUser,async(req,res,next)=>{try{const out=await domain.submitRecord(req.htUser.id,'diet',req.body||{});console.info('[record] saved',JSON.stringify({tool:'diet',duplicate:!!out.duplicate,request_id:req.requestId}));res.json(await responseWithAdvice(req.htUser.id,'diet',out));}catch(e){next(e);}});
-  app.post('/emotion/assessments',requireUser,async(req,res,next)=>{try{const out=await domain.submitRecord(req.htUser.id,'emotion',req.body||{});console.info('[record] saved',JSON.stringify({tool:'emotion',duplicate:!!out.duplicate,request_id:req.requestId}));res.json(await responseWithAdvice(req.htUser.id,'emotion',out));}catch(e){next(e);}});
-  app.post('/sleep/diaries',requireUser,async(req,res,next)=>{try{const out=await domain.submitRecord(req.htUser.id,'sleep',req.body||{});console.info('[record] saved',JSON.stringify({tool:'sleep',duplicate:!!out.duplicate,request_id:req.requestId}));res.json(await responseWithAdvice(req.htUser.id,'sleep',out));}catch(e){next(e);}});
+  // Do not log health payloads, nicknames or openid. Each attempted write is
+  // traceable by request_id and tool, including validation/database failures.
+  function recordEndpoint(path,tool){
+    app.post(path,requireUser,async(req,res,next)=>{
+      console.info('[record] received',JSON.stringify({tool,request_id:req.requestId}));
+      try{
+        const out=await domain.submitRecord(req.htUser.id,tool,req.body||{});
+        console.info('[record] saved',JSON.stringify({tool,duplicate:!!out.duplicate,request_id:req.requestId}));
+        res.json(['sleep','diet','emotion'].includes(tool)?await responseWithAdvice(req.htUser.id,tool,out):out);
+      }catch(err){
+        console.warn('[record] failed',JSON.stringify({tool,code:err.code||'service_error',status:err.status||500,request_id:req.requestId}));
+        next(err);
+      }
+    });
+  }
+  for(const tool of ['breathing','meditation'])recordEndpoint(`/${tool}/sessions`,tool);
+  recordEndpoint('/diet/checkins','diet');
+  recordEndpoint('/emotion/assessments','emotion');
+  recordEndpoint('/sleep/diaries','sleep');
 
   // Read-only acknowledgement scoped to the authenticated WeChat identity.
   // No health payload and no other user's UUID can be exposed.
@@ -143,7 +158,11 @@ function register(app) {
     const tool_stats=await db.query(`SELECT tool_type,COUNT(*) total_count,SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) completed_count FROM healtools_task_records WHERE user_id=? AND health_date BETWEEN ? AND ? AND deleted_at IS NULL GROUP BY tool_type`,[uid,from,to]);
     res.json({from,to,stars,records,plans,tool_stats,server_time:new Date().toISOString()});
   }catch(e){next(e);}});
-  app.get('/daily-insight',requireUser,async(req,res,next)=>{try{res.json(await advisor(req.htUser.id));}catch(e){next(e);}});
+  app.get('/daily-insight',requireUser,async(req,res,next)=>{try{
+    const result=await advisor(req.htUser.id);
+    console.info('[advisor] read',JSON.stringify({available:!!result.available,provider:result.provider||'none',items:Array.isArray(result.items)?result.items.length:0,cached:!!result.cached,request_id:req.requestId}));
+    res.json(result);
+  }catch(e){console.warn('[advisor] read failed',JSON.stringify({code:e.code||'service_error',request_id:req.requestId}));next(e);}});
   app.get('/weekly-insight',requireUser,async(req,res,next)=>{try{const s=await domain.starSummary(req.htUser.id);res.json({week_start:DateTime.utc().startOf('week').toISODate(),insight:{code:'weekly_consistency',text:`本周已记录 ${s.week_star} 颗星。这只是行为记录，不代表医学健康水平。`,non_causal:true}});}catch(e){next(e);}});
 
   const resourceTool={breathing_session:'breathing',meditation_session:'meditation',diet_checkin:'diet',emotion_assessment:'emotion',sleep_diary:'sleep'};
@@ -187,8 +206,8 @@ function register(app) {
   app.delete('/me/data',requireUser,async(req,res,next)=>{try{if(String(req.body?.confirm||'')!=='DELETE')return fail(res,400,'confirmation_required','请提交 confirm=DELETE 以确认删除。');const uid=req.htUser.id;await db.tx(async conn=>{for(const t of ['healtools_consent_records','healtools_daily_cards','healtools_task_records','healtools_star_ledger','healtools_sync_changes','healtools_usage_events','healtools_daily_insights','healtools_advisor_insights','healtools_user_daily_activity','healtools_user_profiles','healtools_user_routines','healtools_wechat_identities'])await conn.execute(`DELETE FROM ${t} WHERE user_id=?`,[uid]);await conn.execute(`DELETE FROM healtools_users WHERE id=?`,[uid]);});res.json({deleted:true,server_time:new Date().toISOString()});}catch(e){next(e);}});
 
   app.get('/admin/diagnostics',basicAuth,async(req,res)=>{
-    try { await db.one('SELECT 1 AS ok');res.json({ok:true,backend:'0.5.0',database:'reachable'}); }
-    catch(err){console.error('[admin/diagnostics]',err.message);res.status(503).json({ok:false,backend:'0.5.0',database:'unavailable',request_id:req.requestId});}
+    try { await db.one('SELECT 1 AS ok');res.json({ok:true,backend:'0.5.1',database:'reachable'}); }
+    catch(err){console.error('[admin/diagnostics]',err.message);res.status(503).json({ok:false,backend:'0.5.1',database:'unavailable',request_id:req.requestId});}
   });
   app.get('/admin',basicAuth,dashboard);
 }
