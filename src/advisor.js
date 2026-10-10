@@ -35,7 +35,7 @@ function fingerprint(rows) {
 }
 async function awaitClaim(userId, today, hash, empty) {
   // Concurrent callers await the winning writer, without launching another AI request.
-  for (let i = 0; i < 30; i++) {
+  for (let i = 0; i < 55; i++) {
     await new Promise(resolve => setTimeout(resolve, 350));
     const row = await db.one('SELECT source_hash,provider,content_json,generated_at FROM healtools_advisor_insights WHERE user_id=? AND insight_date=?',[userId,today]);
     if (row?.source_hash === hash && row.provider !== 'generating' && row.provider !== 'error') {

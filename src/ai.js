@@ -182,7 +182,7 @@ async function generateLifestyleInsight(ctx={}) {
   const envId = String(process.env.CLOUDBASE_AI_ENV_ID).trim();
   const apiKey = String(process.env.CLOUDBASE_AI_API_KEY).trim();
   const modelId = String(process.env.CLOUDBASE_AI_MODEL).trim();
-  const timeoutMs = Math.min(9000, Math.max(2500, Number(process.env.CLOUDBASE_AI_TIMEOUT_MS || 7000)));
+  const timeoutMs = Math.min(20000, Math.max(4000, Number(process.env.CLOUDBASE_AI_TIMEOUT_MS || 15000)));
   const url = `https://${envId}.api.tcloudbasegateway.com/v1/ai/cloudbase/chat/completions`;
   const facts = {
     based_on_date:ctx?.based_on_date || ctx?.yesterday || '',

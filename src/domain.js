@@ -386,7 +386,12 @@ async function submitRecord(userId, tool, p) {
   const record = String(p.record_id || '');
   if (!/^[a-f0-9-]{36}$/i.test(record)) throw Object.assign(new Error('record_id 必须为 UUID'), { status:400, code:'validation_error' });
   const exist = await db.one(`SELECT * FROM healtools_task_records WHERE record_uuid=?`, [record]);
-  if (exist) return { record_id:record, server_version:Number(exist.server_version), task_status:exist.status, star_delta:0, duplicate:true, ...(await starSummary(userId)) };
+  if (exist) {
+    if(Number(exist.user_id)!==Number(userId) || String(exist.tool_type)!==tool || exist.deleted_at) {
+      throw Object.assign(new Error('记录编号已存在但归属或工具不匹配'),{status:409,code:'record_identity_conflict'});
+    }
+    return { record_id:record, server_version:Number(exist.server_version), task_status:exist.status, star_delta:0, duplicate:true, ...(await starSummary(userId)) };
+  }
 
   const h = await healthDate(userId);
   const hd = String(p.health_date || h.health_date);
