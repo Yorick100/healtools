@@ -76,9 +76,16 @@ function register(app) {
       }
       const h=await domain.healthDate(u.id);
       const existing=await domain.currentCards(u.id,h.health_date);
-      const completedCount=existing.filter(x=>x.status==='completed').length;
+      // 客户端已完成而云端未同步时，不能再覆盖这些旧 card_no。
+      const clientDoneNos=Array.isArray(req.body?.client_completed_card_nos)
+        ? [...new Set(req.body.client_completed_card_nos.map(Number).filter(n=>Number.isInteger(n)&&n>=1&&n<=120))]
+        : [];
+      const completedCount=existing.filter(x=>x.status==='completed'||(replan&&clientDoneNos.includes(Number(x.card_no)))).length;
       const remainingNeeded=replan && completedCount>0 && completedCount<existing.length ? existing.length-completedCount : 0;
-      const excludeActionIds=replan ? existing.map(x=>String(x.action_id||'')).filter(Boolean) : [];
+      // 排除整个今天用过的 action，而不是只看当前轮；优先切换不同工具类别。
+      const usedCards=replan ? await db.query(`SELECT action_id,core_task_type FROM healtools_daily_cards WHERE user_id=? AND health_date=? ORDER BY card_no`,[u.id,h.health_date]) : [];
+      const excludeActionIds=usedCards.map(x=>String(x.action_id||'')).filter(Boolean);
+      const excludeTools=replan ? [...new Set(existing.map(x=>String(x.core_task_type||'')).filter(Boolean))] : [];
       await domain.usageEvent(u.id,'ai_prompt_submit',{health_date:h.health_date,quick_count:quick.length,has_text:text?1:0,replan:replan?1:0});
       const history=await domain.recentHealthContext(u.id);
       const rec=await ai.recommend({
@@ -89,12 +96,14 @@ function register(app) {
         minCards:remainingNeeded,
         localHour:h.localHour,
         history,
-        excludeActionIds
+        excludeActionIds,
+        excludeTools
       });
       const rows=await domain.applyPlan(u.id,rec.actions,!!req.body?.light_day,rec.provider,{
         quick_intents:rec.intents,
         history_used:rec.history_used?1:0,
-        replan
+        replan,
+        client_completed_card_nos:clientDoneNos
       });
       await domain.usageEvent(u.id,'ai_recommend_success',{
         health_date:h.health_date,

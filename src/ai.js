@@ -266,7 +266,7 @@ const ALL_ACTION_IDS = Object.keys(ACTIONS);
 
 function timeContext(localHour) { if (localHour < 10) return 'morning'; if (localHour < 17) return 'day'; if (localHour < 21) return 'evening'; return 'night'; }
 
-async function recommend({ quickIntents=[], text='', light=false, maxCards=3, minCards=0, localHour=12, history=null, excludeActionIds=[] }) {
+async function recommend({ quickIntents=[], text='', light=false, maxCards=3, minCards=0, localHour=12, history=null, excludeActionIds=[], excludeTools=[] }) {
   const intents = [];
   const addIntent = x => { if (INTENTS.includes(x) && !intents.includes(x)) intents.push(x); };
   quickIntents.forEach(addIntent);
@@ -311,10 +311,20 @@ async function recommend({ quickIntents=[], text='', light=false, maxCards=3, mi
   count = Math.max(count, Math.min(3, Math.max(0, Number(minCards || 0))));
 
   const excluded = new Set((Array.isArray(excludeActionIds) ? excludeActionIds : []).map(String));
-  let candidates = ids.filter(id => !excluded.has(id));
-  // 理论上 7 个白名单动作足够支撑 1–3 张不同卡；若未来白名单缩小，才允许回退到旧动作。
-  if (candidates.length < count) candidates = candidates.concat(ids.filter(id => excluded.has(id)));
-  const picked = candidates.slice(0, count);
+  const excludedTools = new Set((Array.isArray(excludeTools) ? excludeTools : []).map(String));
+  // 首选没有做过的 action 且属于不同工具；同一轮也尽可能跨工具。
+  // 如果一天内 7 个动作都用过，则退回已用过的动作，不能无限制承诺永不重复。
+  const candidates = ids.map((id,i)=>({id,i,rank:(excluded.has(id)?2:0)+(excludedTools.has(ACTIONS[id].tool)?1:0)}))
+    .sort((a,b)=>a.rank-b.rank||a.i-b.i);
+  const picked = [];
+  const pickedTools = new Set();
+  while (picked.length < count) {
+    const next = candidates.find(c=>!picked.includes(c.id)&&!pickedTools.has(ACTIONS[c.id].tool))
+      || candidates.find(c=>!picked.includes(c.id));
+    if (!next) break;
+    picked.push(next.id);
+    pickedTools.add(ACTIONS[next.id].tool);
+  }
 
   const labels = { energize:'想提提神', annoyed:'有点烦', stressed:'压力有点大', relax:'想放松', focus:'想专注一下', sleep:'准备睡觉' };
   const basis = intents.length ? intents.map(x => labels[x] || x).join('、') : '当前时间';

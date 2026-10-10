@@ -1,6 +1,6 @@
 {
   "name": "healtools-cloudrun",
-  "version": "0.5.1",
+  "version": "0.5.3",
   "private": true,
   "description": "康䇿工具箱 HEALTOOLS 微信云托管服务",
   "main": "index.js",
@@ -10,7 +10,9 @@
     "migrate": "node scripts/migrate.js",
     "test": "node --test tests/*.test.js"
   },
-  "engines": { "node": ">=18" },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "@cloudbase/node-sdk": "^3.18.3",
     "express": "^4.21.2",

@@ -249,14 +249,18 @@ async function applyPlan(userId, actions, light, source, context={}) {
   const h = await healthDate(userId);
   const hd = h.health_date;
   const existing = await currentCards(userId, hd);
-  const completed = existing.filter(x => x.status === 'completed');
-  const allDone = existing.length > 0 && completed.length === existing.length;
   const replan = !!context.replan;
+  // 本地练习可能已完成，但上传记录尚未抵达云端。仅用这些编号来保护旧卡，
+  // 不根据客户端声明发星，星星仍由 submitRecord 的持久化记录来确认。
+  const clientDoneNos = new Set((Array.isArray(context.client_completed_card_nos) ? context.client_completed_card_nos : [])
+    .map(Number).filter(n => Number.isInteger(n) && n >= 1 && n <= 120));
+  const protectedCards = existing.filter(x => x.status === 'completed' || (replan && clientDoneNos.has(Number(x.card_no))));
+  const allDone = existing.length > 0 && protectedCards.length === existing.length;
 
   if (allDone && !replan) return existing;
 
   let target = Math.max(1, Math.min(3, actions.length || 1));
-  if (completed.length && !allDone) target = existing.length;
+  if (protectedCards.length && !allDone) target = existing.length;
 
   const planId = uuid();
   const now = nowSql();
@@ -276,12 +280,14 @@ async function applyPlan(userId, actions, light, source, context={}) {
     let maxNo = Number(mxRows?.[0]?.card_no || 0);
 
     if (allDone && replan) {
-      if (maxNo + target > 120) return;
+      // 所有旧编号都已被使用；下一轮必须分配全新编号，不能覆盖已有星星。
+      const addCount = Math.max(0, Math.min(target, 120 - maxNo));
+      if (!addCount) return;
       await conn.execute(
         `UPDATE healtools_daily_cards SET active=0,updated_at=? WHERE user_id=? AND health_date=? AND active=1`,
         [now, userId, hd]
       );
-      for (let i=0; i<target; i++) {
+      for (let i=0; i<addCount; i++) {
         const a = actions[i] || actions[0];
         if (!a) continue;
         if (maxNo >= 120) break;
@@ -296,10 +302,10 @@ async function applyPlan(userId, actions, light, source, context={}) {
     }
 
     if (existing.length) {
-      if (completed.length) {
+      if (protectedCards.length) {
         let next = 0;
         for (const old of existing) {
-          if (old.status === 'completed') {
+          if (old.status === 'completed' || (replan && clientDoneNos.has(Number(old.card_no)))) {
             await conn.execute(
               `UPDATE healtools_daily_cards SET plan_id=?,active=1,updated_at=? WHERE id=?`,
               [planId, now, old.id]
@@ -419,13 +425,15 @@ async function submitRecord(userId, tool, p) {
 
     if (done && !late && role === 'core' && card >= 1 && card <= 120) {
       let [rows] = await conn.execute(
-        `SELECT * FROM healtools_daily_cards WHERE user_id=? AND health_date=? AND card_no=? AND active=1 FOR UPDATE`,
+        // 旧轮次被设为 inactive 后，迟到的同步记录仍必须能给原编号发星。
+        // 每日 card_no 唯一，不会误关联到新一轮卡片。
+        `SELECT * FROM healtools_daily_cards WHERE user_id=? AND health_date=? AND card_no=? FOR UPDATE`,
         [userId,hd,card]
       );
       let row = rows[0];
       const actionId = String(p.action_id || '');
 
-      if ((!row || row.core_task_type !== tool) && ACTIONS[actionId]) {
+      if ((!row || (row.active && row.core_task_type !== tool)) && ACTIONS[actionId]) {
         const a = ACTIONS[actionId], plan = row && row.plan_id ? row.plan_id : uuid();
         if (row) {
           await conn.execute(
@@ -442,7 +450,7 @@ async function submitRecord(userId, tool, p) {
           );
         }
         [rows] = await conn.execute(
-          `SELECT * FROM healtools_daily_cards WHERE user_id=? AND health_date=? AND card_no=? AND active=1 FOR UPDATE`,
+          `SELECT * FROM healtools_daily_cards WHERE user_id=? AND health_date=? AND card_no=? FOR UPDATE`,
           [userId,hd,card]
         );
         row = rows[0];
